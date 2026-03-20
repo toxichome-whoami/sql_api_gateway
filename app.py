@@ -1,153 +1,108 @@
+from sqlalchemy.sql.roles import TruncatedLabelRole
 import os
+import logging
 from flask import Flask, request, jsonify, abort
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
-import logging
-
-# Configure logging to a file to catch issues in cPanel
+# --- Initialization ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Logging is kept to help with cPanel troubleshooting
 logging.basicConfig(
     filename=os.path.join(PROJECT_ROOT, 'api_gateway.log'),
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables using an absolute path to ensure they are picked up
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
-logger.info("Environment variables loaded.")
 
 app = Flask(__name__)
+API_KEY = os.environ.get("API_KEY")
 
-# ----------------- Configuration & Security -----------------
-API_KEY = os.environ.get("API_KEY", "your_super_secret_api_key_here")
-
+# --- Security ---
 def verify_api_key():
-    """Check the API Key from headers for maximum security."""
-    x_api_key = request.headers.get("X-API-Key")
-    logger.info(f"Received API Key Header: {x_api_key[:5]}... (length: {len(x_api_key) if x_api_key else 0})")
-    
-    if x_api_key != API_KEY:
-        logger.warning(f"Invalid API Key. Expected: {API_KEY[:5]}... (length: {len(API_KEY)})")
-        abort(401, description="Invalid API Key")
-
-@app.errorhandler(401)
-def unauthorized(error):
-    return jsonify({"error": error.description}), 401
-
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": error.description}), 404
-
-@app.errorhandler(400)
-def bad_request(error):
-    return jsonify({"error": error.description}), 400
-
-@app.errorhandler(500)
-def internal_error(error):
-    logger.exception("Internal error occurred.")
-    return jsonify({"error": "Internal Server Error", "message": str(error)}), 500
+    """Verify API Key from X-API-Key header or api_key query parameter."""
+    token = request.headers.get("X-API-Key") or request.args.get("api_key")
+    if token != API_KEY:
+        logger.warning(f"Unauthorized access attempt from {request.remote_addr}")
+        abort(401, description="Invalid or missing API Key")
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    # Log the exception for debugging
-    logger.exception(f"Unexpected error: {str(e)}")
-    return jsonify({"error": "An unexpected error occurred", "message": str(e)}), 500
+    """Global error handler for all exceptions."""
+    logger.exception(f"Error: {str(e)}")
+    status_code = getattr(e, 'code', 500)
+    description = getattr(e, 'description', "Internal Server Error")
+    return jsonify({"error": description, "message": str(e)}), status_code
 
-# ----------------- Dynamic Database Connection Pool -----------------
+# --- Database Management ---
 db_engines = {}
 
 def get_engine(db_name: str):
-    """Dynamically get or create a database engine based on the .env db name."""
-    db_name_upper = db_name.upper()
-    if db_name_upper in db_engines:
-        return db_engines[db_name_upper]
+    """Get or create a cached database engine from environment variables."""
+    db_name = db_name.upper()
+    if db_name in db_engines:
+        return db_engines[db_name]
 
-    # Look for DB_URL_{DB_NAME} in environment
-    env_var_name = f"DB_URL_{db_name_upper}"
-    connection_string = os.environ.get(env_var_name)
-    
+    connection_string = os.environ.get(f"DB_URL_{db_name}")
     if not connection_string:
-        abort(404, description=f"Database '{db_name}' not configured in environment (Missing '{env_var_name}').")
+        abort(404, description=f"Database '{db_name}' not configured.")
 
     try:
-        # Create a new engine, enable ping to checking connection health.
         engine = create_engine(connection_string, pool_pre_ping=True)
-        db_engines[db_name_upper] = engine
+        db_engines[db_name] = engine
         return engine
     except Exception as e:
-        abort(500, description=f"Failed to initialize database engine for '{db_name}': {str(e)}")
+        abort(500, description=f"Database initialization failed: {str(e)}")
 
-# ----------------- Endpoints -----------------
+# --- API Endpoints ---
 
 @app.route("/")
-def read_root():
-    return jsonify({"status": "Gateway is running securely. Access restricted."})
+def index():
+    return jsonify({"status": "Gateway online", "security": "Active"})
 
 @app.route("/api/databases", methods=["GET"])
 def list_databases():
-    """List all configured database endpoints dynamically."""
+    """List all configured databases from environment variables."""
     verify_api_key()
-    configured_dbs = []
-    for key in os.environ:
-        if key.startswith("DB_URL_"):
-            configured_dbs.append(key.replace("DB_URL_", "").lower())
-    return jsonify({"configured_databases": configured_dbs})
+    dbs = [k.replace("DB_URL_", "").lower() for k in os.environ if k.startswith("DB_URL_")]
+    return jsonify({"configured_databases": dbs})
 
 @app.route("/api/<db_name>/query", methods=["POST"])
-def execute_database_query(db_name):
-    """
-    Execute any raw SQL query on the target database dynamically.
-    The `<db_name>` MUST match the .env key `DB_URL_{DB_NAME}`.
-    """
+def execute_query(db_name):
+    """Execute raw SQL queries with parameter binding support."""
     verify_api_key()
-    
+
     data = request.get_json()
     if not data or 'query' not in data:
-        abort(400, description="Missing 'query' in request body.")
-    
+        abort(400, description="Payload must contain 'query'.")
+
     query_str = data.get('query')
     params = data.get('params', {})
-    
+
     engine = get_engine(db_name)
-    
+
     try:
-        with engine.connect() as connection:
-            # text() makes sure sqlalchemy properly wraps the code securely
+        with engine.connect() as conn:
             sql = text(query_str)
-            result = connection.execute(sql, params)
-            
-            # Commit if the query modifies data
+            result = conn.execute(sql, params)
+
+            # Auto-commit for modification queries
             if query_str.strip().upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER")):
-                connection.commit()
-                return jsonify({
-                    "success": True, 
-                    "rowcount": result.rowcount,
-                    "message": "Query executed and changes committed."
-                })
-            
-            # Else fetch data (e.g. SELECT, SHOW)
+                conn.commit()
+                return jsonify({"success": True, "rowcount": result.rowcount})
+
+            # Fetch results for SELECT/SHOW queries
             if result.returns_rows:
-                columns = result.keys()
-                rows = [dict(zip(columns, row)) for row in result.fetchall()]
-                return jsonify({
-                    "success": True,
-                    "rowcount": len(rows),
-                    "data": rows
-                })
-            else:
-                 return jsonify({
-                    "success": True, 
-                    "message": "Query executed successfully. No rows returned."
-                })
+                rows = [dict(row._mapping) for row in result.fetchall()]
+                return jsonify({"success": True, "rowcount": len(rows), "data": rows})
+
+            return jsonify({"success": True, "message": "Query executed."})
 
     except SQLAlchemyError as err:
-        return jsonify({"error": f"Database execution error: {str(err)}"}), 400
-    except Exception as e:
-        return jsonify({"error": f"Internal Error: {str(e)}"}), 500
+        return jsonify({"error": "Database Error", "message": str(err)}), 400
 
 if __name__ == "__main__":
-    # For local development
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True)
