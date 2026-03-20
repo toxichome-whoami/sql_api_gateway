@@ -54,8 +54,7 @@ def apply_security_headers_and_log(response):
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     
     # Comprehensive Request Logging
-    forwarded = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
-    client_ip = forwarded.split(",")[0].strip() or "Unknown"
+    client_ip = get_real_ip()
     logger.info(f"[{client_ip}] {request.method} {request.path} - HTTP {response.status_code}")
     
     return response
@@ -93,14 +92,12 @@ def handle_exception(e):
     return jsonify({"error": description}), status_code
 
 # --- Database Management ---
-db_engines = {}
 db_permissions = {} # Cache for Read-Only vs Read-Write states
 
+@functools.lru_cache(maxsize=16) 
 def get_engine(db_name: str):
-    """Retrieve or initialize a SQLAlchemy engine."""
+    """Retrieve or initialize a SQLAlchemy engine with managed LRU lifecycle."""
     db_name = db_name.upper()
-    if db_name in db_engines:
-        return db_engines[db_name]
 
     connection_string = os.environ.get(f"DB_URL_{db_name}")
     if not connection_string:
@@ -114,13 +111,12 @@ def get_engine(db_name: str):
         # Advanced Connection Pooling for high concurrency and stability
         engine = create_engine(
             connection_string, 
-            pool_pre_ping=True,       # Prevents 'MySQL server has gone away'
-            pool_size=int(os.environ.get("DB_POOL_SIZE", 10)),     # Base active connections
-            max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", 20)), # Spikes allowed
-            pool_recycle=1800,        # Recycle connections every 30 mins
-            pool_timeout=15           # Drop overloaded requests fast to prevent piling up
+            pool_pre_ping=True,      
+            pool_size=int(os.environ.get("DB_POOL_SIZE", 5)),      # Reduced default base connections
+            max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", 10)), # Reduced burst allowed
+            pool_recycle=1200,        # Faster recycle (20 mins)
+            pool_timeout=10           # Faster timeout for better resource cycling
         )
-        db_engines[db_name] = engine
         return engine
     except Exception as e:
         logger.error(f"Failed to connect to {db_name}: {str(e)}")
@@ -191,13 +187,24 @@ def get_table_schema(db_name, table_name):
 
 @app.route("/api/cache/clear", methods=["POST", "OPTIONS"], strict_slashes=False)
 def clear_cache():
-    """Manually flush the LRU metadata cache so newly created tables appear instantly."""
+    """Nuclear Flush: Wipes schema cache, engine pools, and runs Python Garbage Collection."""
     if request.method == "OPTIONS":
         return jsonify({})
     verify_api_key()
+    
+    # Clear all internal memory caches
     _fetch_table_names.cache_clear()
     _fetch_table_schema.cache_clear()
-    return jsonify({"success": True, "message": "Schema cache completely flushed."})
+    get_engine.cache_clear()
+    
+    # Deep OS level Memory Clean
+    import gc
+    freed = gc.collect()
+    
+    return jsonify({
+        "success": True, 
+        "message": f"Cache flushed and {freed} memory objects purged."
+    })
 
 @app.route("/api/<db_name>/query", methods=["POST", "OPTIONS"], strict_slashes=False)
 def execute_query(db_name):
