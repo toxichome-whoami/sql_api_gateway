@@ -4,8 +4,20 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+import logging
+
+# Configure logging to a file to catch issues in cPanel
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+logging.basicConfig(
+    filename=os.path.join(PROJECT_ROOT, 'api_gateway.log'),
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables using an absolute path to ensure they are picked up
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
+logger.info("Environment variables loaded.")
 
 app = Flask(__name__)
 
@@ -15,7 +27,10 @@ API_KEY = os.environ.get("API_KEY", "your_super_secret_api_key_here")
 def verify_api_key():
     """Check the API Key from headers for maximum security."""
     x_api_key = request.headers.get("X-API-Key")
+    logger.info(f"Received API Key Header: {x_api_key[:5]}... (length: {len(x_api_key) if x_api_key else 0})")
+    
     if x_api_key != API_KEY:
+        logger.warning(f"Invalid API Key. Expected: {API_KEY[:5]}... (length: {len(API_KEY)})")
         abort(401, description="Invalid API Key")
 
 @app.errorhandler(401)
@@ -32,7 +47,14 @@ def bad_request(error):
 
 @app.errorhandler(500)
 def internal_error(error):
-    return jsonify({"error": "Internal Server Error"}), 500
+    logger.exception("Internal error occurred.")
+    return jsonify({"error": "Internal Server Error", "message": str(error)}), 500
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    # Log the exception for debugging
+    logger.exception(f"Unexpected error: {str(e)}")
+    return jsonify({"error": "An unexpected error occurred", "message": str(e)}), 500
 
 # ----------------- Dynamic Database Connection Pool -----------------
 db_engines = {}
