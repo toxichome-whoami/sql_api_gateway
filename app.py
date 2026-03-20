@@ -5,6 +5,7 @@ import time
 from flask import Flask, request, jsonify, abort
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import SQLAlchemyError
+import functools
 from dotenv import load_dotenv
 
 # --- Initialization ---
@@ -97,7 +98,15 @@ def get_engine(db_name: str):
     db_permissions[db_name] = mode
 
     try:
-        engine = create_engine(connection_string, pool_pre_ping=True)
+        # Advanced Connection Pooling for high concurrency and stability
+        engine = create_engine(
+            connection_string, 
+            pool_pre_ping=True,       # Prevents 'MySQL server has gone away'
+            pool_size=int(os.environ.get("DB_POOL_SIZE", 10)),     # Base active connections
+            max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", 20)), # Spikes allowed
+            pool_recycle=1800,        # Recycle connections every 30 mins
+            pool_timeout=15           # Drop overloaded requests fast to prevent piling up
+        )
         db_engines[db_name] = engine
         return engine
     except Exception as e:
@@ -146,20 +155,26 @@ def list_databases():
             })
     return jsonify({"configured_databases": dbs})
 
+@functools.lru_cache(maxsize=32)
+def _fetch_table_names(db_name):
+    engine = get_engine(db_name)
+    return inspect(engine).get_table_names()
+
+@functools.lru_cache(maxsize=128)
+def _fetch_table_schema(db_name, table_name):
+    engine = get_engine(db_name)
+    columns = inspect(engine).get_columns(table_name)
+    return [{"name": c['name'], "type": str(c['type']), "nullable": c['nullable']} for c in columns]
+
 @app.route("/api/<db_name>/tables", methods=["GET", "OPTIONS"], strict_slashes=False)
 def list_tables(db_name):
     verify_api_key()
-    engine = get_engine(db_name)
-    tables = inspect(engine).get_table_names()
-    return jsonify({"database": db_name, "tables": tables})
+    return jsonify({"database": db_name, "tables": _fetch_table_names(db_name)})
 
 @app.route("/api/<db_name>/table/<table_name>/schema", methods=["GET", "OPTIONS"], strict_slashes=False)
 def get_table_schema(db_name, table_name):
     verify_api_key()
-    engine = get_engine(db_name)
-    columns = inspect(engine).get_columns(table_name)
-    schema = [{"name": c['name'], "type": str(c['type']), "nullable": c['nullable']} for c in columns]
-    return jsonify({"database": db_name, "table": table_name, "schema": schema})
+    return jsonify({"database": db_name, "table": table_name, "schema": _fetch_table_schema(db_name, table_name)})
 
 @app.route("/api/<db_name>/query", methods=["POST", "OPTIONS"], strict_slashes=False)
 def execute_query(db_name):
