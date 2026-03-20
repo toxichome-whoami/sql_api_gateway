@@ -1,299 +1,513 @@
-
 import os
-import logging
+import re
 import time
-from flask import Flask, request, jsonify, abort
+import json
+import logging
+from logging.handlers import RotatingFileHandler
+from functools import wraps, lru_cache
+
+from flask import Flask, request, jsonify
 from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import SQLAlchemyError
-import functools
+from sqlalchemy.engine import Engine
 from dotenv import load_dotenv
 
-# --- Initialization ---
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+load_dotenv()
 
-logging.basicConfig(
-    filename=os.path.join(PROJECT_ROOT, 'api_gateway.log'),
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 app = Flask(__name__)
-API_KEY = os.environ.get("API_KEY")
 
-# Global Rate Limiting
-def get_real_ip():
-    forwarded = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
-    return forwarded.split(",")[0].strip() or "127.0.0.1"
+# =========================================================
+# Configuration
+# =========================================================
+
+API_KEY = os.getenv("API_KEY", "").strip()
+ALLOWED_IPS_RAW = os.getenv("ALLOWED_IPS", "").strip()
+ALLOWED_IPS = {ip.strip() for ip in ALLOWED_IPS_RAW.split(",") if ip.strip()}
+
+RATE_LIMIT = os.getenv("RATE_LIMIT", "60 per minute").strip()
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+
+LOG_FILE = os.getenv("LOG_FILE", "api_gateway.log")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+# =========================================================
+# Logging
+# =========================================================
+
+if not app.logger.handlers:
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s"
+    )
+    handler.setFormatter(formatter)
+    handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+    app.logger.addHandler(handler)
+    app.logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+# =========================================================
+# Rate Limiter
+# =========================================================
 
 limiter = Limiter(
-    get_real_ip,
+    key_func=get_remote_address,
     app=app,
-    default_limits=[os.environ.get("RATE_LIMIT", "1000 per minute")],
-    storage_uri="memory://"
+    default_limits=[RATE_LIMIT]
 )
 
-# --- Advanced Security Configuration ---
-# 1. IP Whitelisting: Comma-separated list of safe IPs. If empty, all IPs allowed.
-ALLOWED_IPS = [ip.strip() for ip in os.environ.get("ALLOWED_IPS", "").split(",") if ip.strip()]
+# =========================================================
+# Database Registry
+# =========================================================
 
-# 2. CORS Allow Origin: Set specific frontend domains, default is all
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
+DATABASES = {}  # { alias: {"url": str, "mode": "READONLY"/"READWRITE", "engine": Engine} }
 
-@app.after_request
-def apply_security_headers_and_log(response):
-    """Apply strict security headers, CORS, and log every request."""
-    response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    
-    # Security definitions
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    
-    # Comprehensive Request Logging
-    client_ip = get_real_ip()
-    logger.info(f"[{client_ip}] {request.method} {request.path} - HTTP {response.status_code}")
-    
-    return response
+
+def load_databases():
+    global DATABASES
+    DATABASES = {}
+
+    for key, value in os.environ.items():
+        if key.startswith("DB_URL_"):
+            alias = key[len("DB_URL_"):].strip().lower()
+            db_url = value.strip()
+            mode = os.getenv(f"DB_MODE_{alias.upper()}", "READWRITE").strip().upper()
+
+            engine = build_engine(db_url)
+            DATABASES[alias] = {
+                "url": db_url,
+                "mode": mode,
+                "engine": engine
+            }
+
+    app.logger.info("Loaded databases: %s", list(DATABASES.keys()))
+
+
+def build_engine(db_url: str) -> Engine:
+    engine_kwargs = {
+        "pool_pre_ping": True,
+        "future": True,
+    }
+
+    if not db_url.startswith("sqlite"):
+        engine_kwargs["pool_size"] = DB_POOL_SIZE
+        engine_kwargs["max_overflow"] = DB_MAX_OVERFLOW
+
+    return create_engine(db_url, **engine_kwargs)
+
+
+load_databases()
+
+# =========================================================
+# Helpers
+# =========================================================
+
+WRITE_KEYWORDS = {
+    "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE",
+    "REPLACE", "MERGE", "GRANT", "REVOKE", "VACUUM", "ANALYZE"
+}
+
+
+def get_client_ip():
+    x_forwarded_for = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    if x_forwarded_for:
+        return x_forwarded_for
+    return request.remote_addr or "unknown"
+
+
+def require_api_key(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        provided_key = request.headers.get("X-API-Key", "").strip() or request.args.get("api_key", "").strip()
+
+        if not API_KEY:
+            return jsonify({"error": "Server misconfiguration: API_KEY not set"}), 500
+
+        if provided_key != API_KEY:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_ip_allowlist(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not ALLOWED_IPS:
+            return f(*args, **kwargs)
+
+        client_ip = get_client_ip()
+        if client_ip not in ALLOWED_IPS:
+            return jsonify({"error": "Forbidden: IP not allowed", "ip": client_ip}), 403
+
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def get_db_or_404(db_name: str):
+    db = DATABASES.get(db_name.lower())
+    if not db:
+        return None, (jsonify({"error": f"Unknown database '{db_name}'"}), 404)
+    return db, None
+
+
+def is_select_query(sql: str) -> bool:
+    return bool(re.match(r"^\s*SELECT\b", sql, flags=re.IGNORECASE))
+
+
+def has_limit_clause(sql: str) -> bool:
+    return bool(re.search(r"\bLIMIT\s+\d+\b", sql, flags=re.IGNORECASE))
+
+
+def normalize_sql(sql: str) -> str:
+    return sql.strip().rstrip(";").strip()
+
+
+def enforce_select_limit(sql: str) -> str:
+    normalized = normalize_sql(sql)
+    if is_select_query(normalized) and not has_limit_clause(normalized):
+        return f"{normalized} LIMIT 1000"
+    return normalized
+
+
+def first_sql_keyword(sql: str) -> str:
+    normalized = normalize_sql(sql)
+    match = re.match(r"^\s*([A-Z]+)\b", normalized, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
+def is_write_query(sql: str) -> bool:
+    keyword = first_sql_keyword(sql)
+    return keyword in WRITE_KEYWORDS
+
+
+def validate_readonly(db_mode: str, sql: str):
+    if db_mode == "READONLY" and is_write_query(sql):
+        raise PermissionError("Write operation blocked: database is in READONLY mode")
+
+
+def rows_to_dicts(result):
+    if result.returns_rows:
+        return [dict(row._mapping) for row in result.fetchall()]
+    return None
+
+
+def log_request_and_sql(path, method, db_name=None, sql=None, elapsed_ms=None, error=None):
+    payload = {
+        "ip": get_client_ip(),
+        "method": method,
+        "path": path,
+        "db": db_name,
+        "elapsed_ms": elapsed_ms,
+        "sql": sql,
+        "error": str(error) if error else None
+    }
+    app.logger.info(json.dumps(payload, default=str))
+
+
+# =========================================================
+# Cached Metadata
+# =========================================================
+
+@lru_cache(maxsize=128)
+def get_tables_cached(db_name: str):
+    db = DATABASES[db_name]
+    inspector = inspect(db["engine"])
+    return inspector.get_table_names()
+
+
+@lru_cache(maxsize=512)
+def get_schema_cached(db_name: str, table_name: str):
+    db = DATABASES[db_name]
+    inspector = inspect(db["engine"])
+    columns = inspector.get_columns(table_name)
+    pk = inspector.get_pk_constraint(table_name)
+
+    primary_keys = set(pk.get("constrained_columns") or [])
+
+    schema = []
+    for col in columns:
+        schema.append({
+            "name": col.get("name"),
+            "type": str(col.get("type")),
+            "nullable": col.get("nullable"),
+            "default": str(col.get("default")) if col.get("default") is not None else None,
+            "primary_key": col.get("name") in primary_keys
+        })
+    return schema
+
+
+def clear_metadata_cache():
+    get_tables_cached.cache_clear()
+    get_schema_cached.cache_clear()
+
+# =========================================================
+# Request Hooks
+# =========================================================
 
 @app.before_request
-def check_ip_whitelist():
-    """Block IPs that are not explicitly whitelisted (if whitelist is active)."""
-    if ALLOWED_IPS:
-        forwarded = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
-        client_ip = forwarded.split(",")[0].strip()
-        if client_ip and client_ip not in ALLOWED_IPS:
-            logger.warning(f"Blocked request from non-whitelisted IP: {client_ip}")
-            abort(403, description="Access forbidden: Your IP is not permitted.")
+def before_request():
+    request._start_time = time.perf_counter()
 
-def verify_api_key():
-    """Verify Master Key from X-API-Key header OR api_key query parameter."""
-    if request.method == "OPTIONS":
-        return # Allow CORS preflight
 
-    token = request.headers.get("X-API-Key") or request.args.get("api_key")
-    if not token or token != API_KEY:
-        logger.warning(f"Unauthorized API access attempt. Invalid/Missing API Key.")
-        abort(401, description="Invalid or missing API Key")
-
-@app.errorhandler(Exception)
-def handle_exception(e):
-    """Global error handler hiding internal stack traces from clients."""
-    status_code = getattr(e, 'code', 500)
-    # Hide internal details for 500 errors to prevent info leakage
-    if status_code == 500:
-        logger.exception("Internal Server Error")
-        description = "Internal Server Error"
-    else:
-        description = getattr(e, 'description', "Error")
-    return jsonify({"error": description}), status_code
-
-# --- Database Management ---
-db_permissions = {} # Cache for Read-Only vs Read-Write states
-
-@functools.lru_cache(maxsize=16) 
-def get_engine(db_name: str):
-    """Retrieve or initialize a SQLAlchemy engine with managed LRU lifecycle."""
-    db_name = db_name.upper()
-
-    connection_string = os.environ.get(f"DB_URL_{db_name}")
-    if not connection_string:
-        abort(404, description=f"Database '{db_name}' not configured.")
-
-    # Apply database operation mode (READWRITE by default)
-    mode = os.environ.get(f"DB_MODE_{db_name}", "READWRITE").upper()
-    db_permissions[db_name] = mode
-
+@app.after_request
+def after_request(response):
+    elapsed_ms = round((time.perf_counter() - getattr(request, "_start_time", time.perf_counter())) * 1000, 2)
     try:
-        # Advanced Connection Pooling for high concurrency and stability
-        engine = create_engine(
-            connection_string, 
-            pool_pre_ping=True,      
-            pool_size=int(os.environ.get("DB_POOL_SIZE", 5)),      # Reduced default base connections
-            max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", 10)), # Reduced burst allowed
-            pool_recycle=1200,        # Faster recycle (20 mins)
-            pool_timeout=10           # Faster timeout for better resource cycling
+        log_request_and_sql(
+            path=request.path,
+            method=request.method,
+            elapsed_ms=elapsed_ms
         )
-        return engine
-    except Exception as e:
-        logger.error(f"Failed to connect to {db_name}: {str(e)}")
-        abort(500, description="Database initialization failed.")
+    except Exception:
+        pass
+    return response
 
-# --- Endpoints ---
+# =========================================================
+# Error Handlers
+# =========================================================
 
-@app.route("/", methods=["GET", "OPTIONS"], strict_slashes=False)
-def index():
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({"error": "Rate limit exceeded"}), 429
+
+
+@app.errorhandler(404)
+def not_found_handler(e):
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.errorhandler(500)
+def internal_error_handler(e):
+    return jsonify({"error": "Internal server error"}), 500
+
+# =========================================================
+# Routes
+# =========================================================
+
+@app.route("/health", methods=["GET"])
+def health():
+    results = {}
+
+    for alias, db in DATABASES.items():
+        try:
+            with db["engine"].connect() as conn:
+                conn.execute(text("SELECT 1"))
+            results[alias] = {
+                "status": "online",
+                "mode": db["mode"]
+            }
+        except Exception as e:
+            results[alias] = {
+                "status": "offline",
+                "mode": db["mode"],
+                "error": str(e)
+            }
+
     return jsonify({
-        "status": "Gateway online",
-        "security": "Maximum",
-        "ip_whitelisting": "Enabled" if ALLOWED_IPS else "Disabled"
+        "status": "ok",
+        "databases": results
     })
 
-@app.route("/health", methods=["GET", "OPTIONS"], strict_slashes=False)
-def health_check():
-    """Monitor connectivity to all databases and return statuses."""
-    status = {"status": "ok", "databases": {}}
-    for key in os.environ:
-        if key.startswith("DB_URL_"):
-            name = key.replace("DB_URL_", "").lower()
-            try:
-                engine = get_engine(name)
-                with engine.connect() as conn:
-                    conn.execute(text("SELECT 1"))
-                mode = db_permissions.get(name.upper(), "UNKNOWN")
-                status["databases"][name] = {"status": "connected", "mode": mode}
-            except Exception:
-                status["status"] = "degraded"
-                status["databases"][name] = {"status": "offline"}
-    return jsonify(status)
 
-@app.route("/api/databases", methods=["GET", "OPTIONS"], strict_slashes=False)
+@app.route("/api/databases", methods=["GET"])
+@require_ip_allowlist
+@require_api_key
 def list_databases():
-    verify_api_key()
-    dbs = []
-    for k in os.environ:
-        if k.startswith("DB_URL_"):
-            db_name = k.replace("DB_URL_", "").lower()
-            get_engine(db_name) # Ensure permissions cache is populated
-            dbs.append({
-                "name": db_name,
-                "mode": db_permissions.get(db_name.upper(), "READWRITE")
-            })
-    return jsonify({"configured_databases": dbs})
-
-@functools.lru_cache(maxsize=32)
-def _fetch_table_names(db_name):
-    engine = get_engine(db_name)
-    return inspect(engine).get_table_names()
-
-@functools.lru_cache(maxsize=128)
-def _fetch_table_schema(db_name, table_name):
-    engine = get_engine(db_name)
-    columns = inspect(engine).get_columns(table_name)
-    return [{"name": c['name'], "type": str(c['type']), "nullable": c['nullable']} for c in columns]
-
-@app.route("/api/<db_name>/tables", methods=["GET", "OPTIONS"], strict_slashes=False)
-def list_tables(db_name):
-    verify_api_key()
-    return jsonify({"database": db_name, "tables": _fetch_table_names(db_name)})
-
-@app.route("/api/<db_name>/table/<table_name>/schema", methods=["GET", "OPTIONS"], strict_slashes=False)
-def get_table_schema(db_name, table_name):
-    verify_api_key()
-    return jsonify({"database": db_name, "table": table_name, "schema": _fetch_table_schema(db_name, table_name)})
-
-@app.route("/api/cache/clear", methods=["POST", "OPTIONS"], strict_slashes=False)
-def clear_cache():
-    """Nuclear Flush: Wipes schema cache, engine pools, and runs Python Garbage Collection."""
-    if request.method == "OPTIONS":
-        return jsonify({})
-    verify_api_key()
-    
-    # Clear all internal memory caches
-    _fetch_table_names.cache_clear()
-    _fetch_table_schema.cache_clear()
-    get_engine.cache_clear()
-    
-    # Deep OS level Memory Clean
-    import gc
-    freed = gc.collect()
-    
     return jsonify({
-        "success": True, 
-        "message": f"Cache flushed and {freed} memory objects purged."
+        "databases": [
+            {"name": alias, "mode": cfg["mode"]}
+            for alias, cfg in DATABASES.items()
+        ]
     })
 
-@app.route("/api/<db_name>/query", methods=["POST", "OPTIONS"], strict_slashes=False)
-def execute_query(db_name):
-    """Execute single or multiple SQL queries within a secure transaction scope."""
-    if request.method == "OPTIONS":
-        return jsonify({}) # Required for CORS
 
-    verify_api_key()
+@app.route("/api/<db_name>/tables", methods=["GET"])
+@require_ip_allowlist
+@require_api_key
+def list_tables(db_name):
+    db, err = get_db_or_404(db_name)
+    if err:
+        return err
 
-    data = request.get_json()
-    if not data:
-        abort(400, description="Payload must contain JSON.")
-
-    # Parse Payload Batch
-    queries = []
-    if 'queries' in data and isinstance(data['queries'], list):
-        queries = data['queries']
-    elif 'query' in data:
-        queries = [{"query": data['query'], "params": data.get('params', {})}]
-    else:
-        abort(400, description="Payload must contain 'query' string or 'queries' array.")
-
-    engine = get_engine(db_name)
-    start_time = time.time()
-    
-    # Pre-flight Validation & Auto-Clamping Loop
-    for q in queries:
-        query_str = q.get('query', '').strip()
-        
-        # Security Rule 1: Prevent basic stacked queries INSIDE single entries
-        if ";" in query_str.rstrip(";"):
-            logger.warning(f"Blocked inline multi-statement query attempt.")
-            abort(400, description="Multiple SQL statements restricted per field. Use 'queries' array for transactions.")
-
-        # Security Rule 2: Database Mode Enforcement
-        is_modifying = query_str.upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "REPLACE"))
-        if is_modifying and db_permissions.get(db_name.upper()) == "READONLY":
-            logger.warning(f"Blocked write attempt on READONLY database {db_name}")
-            abort(403, description=f"Database '{db_name}' is locked in READONLY mode.")
-            
-        # Security Rule 3: Forced Safe Pagination
-        if query_str.upper().startswith("SELECT") and "LIMIT" not in query_str.upper():
-            query_str = query_str.rstrip(";") + " LIMIT 1000"
-            logger.info("Automatically clamped unpaginated SELECT query with LIMIT 1000")
-            
-        q['safe_query'] = query_str
-        q['is_modifying'] = is_modifying
-
-    results = []
     try:
-        # Transaction Context Manager - Error in any query rolls back the ENTIRE batch instantly
-        with engine.begin() as conn:
-            for q in queries:
-                sql = text(q['safe_query'])
-                result = conn.execute(sql, q.get('params', {}))
-                
-                if result.returns_rows:
-                    rows = [dict(row._mapping) for row in result.fetchall()]
-                    results.append({"rowcount": len(rows), "data": rows})
-                elif q['is_modifying']:
-                    results.append({"rowcount": result.rowcount})
-                else:
-                    results.append({"message": "Query executed successfully."})
-
-        exec_time_ms = round((time.time() - start_time) * 1000, 2)
-        
-        logger.info(f"Transaction on '{db_name}' completed ({len(queries)} ops) in {exec_time_ms}ms")
-        
-        if exec_time_ms > 1000:
-            logger.warning(f"Slow Transaction Alert '{db_name}' ({exec_time_ms}ms) across {len(queries)} operations.")
-
-        # Backward compatibility wrapper for single-query requests
-        if 'query' in data and not 'queries' in data:
-            final_res = results[0]
-            final_res['success'] = True
-            final_res['execution_time_ms'] = exec_time_ms
-            return jsonify(final_res)
-            
+        tables = get_tables_cached(db_name.lower())
         return jsonify({
-            "success": True, 
-            "execution_time_ms": exec_time_ms,
-            "transaction_count": len(results),
-            "results": results
+            "database": db_name.lower(),
+            "tables": tables
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/<db_name>/table/<table_name>/schema", methods=["GET"])
+@require_ip_allowlist
+@require_api_key
+def get_table_schema(db_name, table_name):
+    db, err = get_db_or_404(db_name)
+    if err:
+        return err
+
+    try:
+        schema = get_schema_cached(db_name.lower(), table_name)
+        return jsonify({
+            "database": db_name.lower(),
+            "table": table_name,
+            "schema": schema
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/cache/clear", methods=["POST"])
+@require_ip_allowlist
+@require_api_key
+def cache_clear():
+    clear_metadata_cache()
+    return jsonify({"message": "Metadata cache cleared"})
+
+
+@app.route("/api/<db_name>/query", methods=["POST"])
+@require_ip_allowlist
+@require_api_key
+def execute_query(db_name):
+    db, err = get_db_or_404(db_name)
+    if err:
+        return err
+
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
+
+    single_query = payload.get("query")
+    single_params = payload.get("params", {})
+    batch_queries = payload.get("queries")
+
+    if not single_query and not batch_queries:
+        return jsonify({"error": "Provide either 'query' or 'queries'"}), 400
+
+    start = time.perf_counter()
+
+    try:
+        if single_query:
+            sql = enforce_select_limit(single_query)
+            validate_readonly(db["mode"], sql)
+
+            with db["engine"].begin() as conn:
+                result = conn.execute(text(sql), single_params or {})
+                rows = rows_to_dicts(result)
+
+                response = {
+                    "database": db_name.lower(),
+                    "mode": db["mode"],
+                    "query": sql,
+                    "rowcount": result.rowcount
+                }
+
+                if rows is not None:
+                    response["rows"] = rows
+
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            log_request_and_sql(
+                path=request.path,
+                method=request.method,
+                db_name=db_name.lower(),
+                sql=sql,
+                elapsed_ms=elapsed_ms
+            )
+            return jsonify(response)
+
+        if batch_queries:
+            if not isinstance(batch_queries, list) or not batch_queries:
+                return jsonify({"error": "'queries' must be a non-empty list"}), 400
+
+            responses = []
+
+            with db["engine"].begin() as conn:
+                for idx, item in enumerate(batch_queries, start=1):
+                    if not isinstance(item, dict) or "query" not in item:
+                        return jsonify({"error": f"Invalid query object at index {idx - 1}"}), 400
+
+                    sql = enforce_select_limit(item["query"])
+                    params = item.get("params", {}) or {}
+
+                    validate_readonly(db["mode"], sql)
+
+                    result = conn.execute(text(sql), params)
+                    rows = rows_to_dicts(result)
+
+                    entry = {
+                        "index": idx,
+                        "query": sql,
+                        "rowcount": result.rowcount
+                    }
+                    if rows is not None:
+                        entry["rows"] = rows
+
+                    responses.append(entry)
+
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            log_request_and_sql(
+                path=request.path,
+                method=request.method,
+                db_name=db_name.lower(),
+                sql=f"BATCH ({len(batch_queries)} queries)",
+                elapsed_ms=elapsed_ms
+            )
+
+            return jsonify({
+                "database": db_name.lower(),
+                "mode": db["mode"],
+                "transaction": "committed",
+                "results": responses
+            })
+
+    except PermissionError as e:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_request_and_sql(
+            path=request.path,
+            method=request.method,
+            db_name=db_name.lower(),
+            sql=single_query or "BATCH",
+            elapsed_ms=elapsed_ms,
+            error=e
+        )
+        return jsonify({"error": str(e)}), 403
 
     except SQLAlchemyError as e:
-        logger.error(f"Execution Error: {str(e)}")
-        # Client intentionally receives a blanket message to prevent exposing exact internal DB states if a transaction fails
-        abort(400, description="Database Execution Error. The entire query batch has been successfully isolated and rolled back.")
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_request_and_sql(
+            path=request.path,
+            method=request.method,
+            db_name=db_name.lower(),
+            sql=single_query or "BATCH",
+            elapsed_ms=elapsed_ms,
+            error=e
+        )
+        return jsonify({
+            "error": "Database error",
+            "details": str(e)
+        }), 400
+
+    except Exception as e:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_request_and_sql(
+            path=request.path,
+            method=request.method,
+            db_name=db_name.lower(),
+            sql=single_query or "BATCH",
+            elapsed_ms=elapsed_ms,
+            error=e
+        )
+        return jsonify({
+            "error": "Unexpected server error",
+            "details": str(e)
+        }), 500
+
+# =========================================================
+# Main
+# =========================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=False)
