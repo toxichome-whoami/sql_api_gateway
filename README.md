@@ -8,8 +8,6 @@ Designed specifically for easy deployment on cPanel via Phusion Passenger.
 1. [Installation & Setup (cPanel)](#1-installation--setup-cpanel)
 2. [How to Use the Features](#2-how-to-use-the-features)
 
----
-
 ## 1. Installation & Setup (cPanel)
 
 This API Gateway natively supports deployment using cPanel's **Setup Python App** feature.
