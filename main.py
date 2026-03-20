@@ -132,7 +132,4 @@ def execute_database_query(db_name: str, payload: QueryRequest):
         )
 
 # ----------------- App Runner -----------------
-if __name__ == "__main__":
-    host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+# (App Runner section removed; cPanel auto-sets the ASGI server)
