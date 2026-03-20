@@ -2,9 +2,11 @@ import os
 import re
 import time
 import json
+import sqlite3
+import hashlib
 import logging
 from logging.handlers import RotatingFileHandler
-from functools import wraps, lru_cache
+from functools import wraps
 
 from flask import Flask, request, jsonify
 from flask_limiter import Limiter
@@ -33,15 +35,16 @@ DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
 LOG_FILE = os.getenv("LOG_FILE", "api_gateway.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
+CACHE_DB_FILE = os.getenv("CACHE_DB_FILE", "metadata_cache.db").strip()
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min default
+
 # =========================================================
 # Logging
 # =========================================================
 
 if not app.logger.handlers:
     handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
-    formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s"
-    )
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     handler.setFormatter(formatter)
     handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
     app.logger.addHandler(handler)
@@ -61,27 +64,7 @@ limiter = Limiter(
 # Database Registry
 # =========================================================
 
-DATABASES = {}  # { alias: {"url": str, "mode": "READONLY"/"READWRITE", "engine": Engine} }
-
-
-def load_databases():
-    global DATABASES
-    DATABASES = {}
-
-    for key, value in os.environ.items():
-        if key.startswith("DB_URL_"):
-            alias = key[len("DB_URL_"):].strip().lower()
-            db_url = value.strip()
-            mode = os.getenv(f"DB_MODE_{alias.upper()}", "READWRITE").strip().upper()
-
-            engine = build_engine(db_url)
-            DATABASES[alias] = {
-                "url": db_url,
-                "mode": mode,
-                "engine": engine
-            }
-
-    app.logger.info("Loaded databases: %s", list(DATABASES.keys()))
+DATABASES = {}
 
 
 def build_engine(db_url: str) -> Engine:
@@ -97,7 +80,136 @@ def build_engine(db_url: str) -> Engine:
     return create_engine(db_url, **engine_kwargs)
 
 
+def load_databases():
+    global DATABASES
+    DATABASES = {}
+
+    for key, value in os.environ.items():
+        if key.startswith("DB_URL_"):
+            alias = key[len("DB_URL_"):].strip().lower()
+            db_url = value.strip()
+            mode = os.getenv(f"DB_MODE_{alias.upper()}", "READWRITE").strip().upper()
+
+            DATABASES[alias] = {
+                "url": db_url,
+                "mode": mode,
+                "engine": build_engine(db_url)
+            }
+
+    app.logger.info("Loaded databases: %s", list(DATABASES.keys()))
+
+
 load_databases()
+
+# =========================================================
+# SQLite Cache
+# =========================================================
+
+def get_cache_conn():
+    conn = sqlite3.connect(CACHE_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_cache_db():
+    with get_cache_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metadata_cache (
+                cache_key TEXT PRIMARY KEY,
+                cache_type TEXT NOT NULL,
+                db_name TEXT NOT NULL,
+                table_name TEXT,
+                value_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_type ON metadata_cache(cache_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_db_name ON metadata_cache(db_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_table_name ON metadata_cache(table_name)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_cache_expires_at ON metadata_cache(expires_at)")
+        conn.commit()
+
+
+def make_cache_key(cache_type: str, db_name: str, table_name: str = None) -> str:
+    raw = f"{cache_type}:{db_name}:{table_name or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def cache_get(cache_type: str, db_name: str, table_name: str = None):
+    now = int(time.time())
+    cache_key = make_cache_key(cache_type, db_name, table_name)
+
+    with get_cache_conn() as conn:
+        row = conn.execute("""
+            SELECT value_json, expires_at
+            FROM metadata_cache
+            WHERE cache_key = ?
+        """, (cache_key,)).fetchone()
+
+        if not row:
+            return None
+
+        if row["expires_at"] < now:
+            conn.execute("DELETE FROM metadata_cache WHERE cache_key = ?", (cache_key,))
+            conn.commit()
+            return None
+
+        return json.loads(row["value_json"])
+
+
+def cache_set(cache_type: str, db_name: str, value, table_name: str = None, ttl: int = CACHE_TTL_SECONDS):
+    now = int(time.time())
+    expires_at = now + ttl
+    cache_key = make_cache_key(cache_type, db_name, table_name)
+
+    with get_cache_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO metadata_cache
+            (cache_key, cache_type, db_name, table_name, value_json, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            cache_key,
+            cache_type,
+            db_name,
+            table_name,
+            json.dumps(value, default=str),
+            now,
+            expires_at
+        ))
+        conn.commit()
+
+
+def cache_delete_all():
+    with get_cache_conn() as conn:
+        conn.execute("DELETE FROM metadata_cache")
+        conn.commit()
+
+
+def cache_delete_db(db_name: str):
+    with get_cache_conn() as conn:
+        conn.execute("DELETE FROM metadata_cache WHERE db_name = ?", (db_name,))
+        conn.commit()
+
+
+def cache_delete_table(db_name: str, table_name: str):
+    with get_cache_conn() as conn:
+        conn.execute("""
+            DELETE FROM metadata_cache
+            WHERE db_name = ? AND table_name = ?
+        """, (db_name, table_name))
+        conn.commit()
+
+
+def cleanup_expired_cache():
+    now = int(time.time())
+    with get_cache_conn() as conn:
+        conn.execute("DELETE FROM metadata_cache WHERE expires_at < ?", (now,))
+        conn.commit()
+
+
+init_cache_db()
+cleanup_expired_cache()
 
 # =========================================================
 # Helpers
@@ -205,20 +317,32 @@ def log_request_and_sql(path, method, db_name=None, sql=None, elapsed_ms=None, e
     }
     app.logger.info(json.dumps(payload, default=str))
 
-
 # =========================================================
-# Cached Metadata
+# Cached Metadata Functions
 # =========================================================
 
-@lru_cache(maxsize=128)
 def get_tables_cached(db_name: str):
+    db_name = db_name.lower()
+
+    cached = cache_get("tables", db_name)
+    if cached is not None:
+        return cached
+
     db = DATABASES[db_name]
     inspector = inspect(db["engine"])
-    return inspector.get_table_names()
+    tables = inspector.get_table_names()
+
+    cache_set("tables", db_name, tables)
+    return tables
 
 
-@lru_cache(maxsize=512)
 def get_schema_cached(db_name: str, table_name: str):
+    db_name = db_name.lower()
+
+    cached = cache_get("schema", db_name, table_name)
+    if cached is not None:
+        return cached
+
     db = DATABASES[db_name]
     inspector = inspect(db["engine"])
     columns = inspector.get_columns(table_name)
@@ -235,12 +359,18 @@ def get_schema_cached(db_name: str, table_name: str):
             "default": str(col.get("default")) if col.get("default") is not None else None,
             "primary_key": col.get("name") in primary_keys
         })
+
+    cache_set("schema", db_name, schema, table_name=table_name)
     return schema
 
 
-def clear_metadata_cache():
-    get_tables_cached.cache_clear()
-    get_schema_cached.cache_clear()
+def clear_metadata_cache(db_name=None, table_name=None):
+    if db_name and table_name:
+        cache_delete_table(db_name.lower(), table_name)
+    elif db_name:
+        cache_delete_db(db_name.lower())
+    else:
+        cache_delete_all()
 
 # =========================================================
 # Request Hooks
@@ -332,10 +462,11 @@ def list_tables(db_name):
         return err
 
     try:
-        tables = get_tables_cached(db_name.lower())
+        tables = get_tables_cached(db_name)
         return jsonify({
             "database": db_name.lower(),
-            "tables": tables
+            "tables": tables,
+            "cache": "sqlite"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -350,11 +481,12 @@ def get_table_schema(db_name, table_name):
         return err
 
     try:
-        schema = get_schema_cached(db_name.lower(), table_name)
+        schema = get_schema_cached(db_name, table_name)
         return jsonify({
             "database": db_name.lower(),
             "table": table_name,
-            "schema": schema
+            "schema": schema,
+            "cache": "sqlite"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -364,8 +496,19 @@ def get_table_schema(db_name, table_name):
 @require_ip_allowlist
 @require_api_key
 def cache_clear():
-    clear_metadata_cache()
-    return jsonify({"message": "Metadata cache cleared"})
+    payload = request.get_json(silent=True) or {}
+    db_name = payload.get("db_name")
+    table_name = payload.get("table_name")
+
+    clear_metadata_cache(db_name=db_name, table_name=table_name)
+
+    return jsonify({
+        "message": "Metadata cache cleared",
+        "scope": {
+            "db_name": db_name,
+            "table_name": table_name
+        }
+    })
 
 
 @app.route("/api/<db_name>/query", methods=["POST"])
@@ -408,6 +551,9 @@ def execute_query(db_name):
                 if rows is not None:
                     response["rows"] = rows
 
+            if is_write_query(sql):
+                clear_metadata_cache(db_name=db_name)
+
             elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
             log_request_and_sql(
                 path=request.path,
@@ -423,6 +569,7 @@ def execute_query(db_name):
                 return jsonify({"error": "'queries' must be a non-empty list"}), 400
 
             responses = []
+            had_write = False
 
             with db["engine"].begin() as conn:
                 for idx, item in enumerate(batch_queries, start=1):
@@ -433,6 +580,9 @@ def execute_query(db_name):
                     params = item.get("params", {}) or {}
 
                     validate_readonly(db["mode"], sql)
+
+                    if is_write_query(sql):
+                        had_write = True
 
                     result = conn.execute(text(sql), params)
                     rows = rows_to_dicts(result)
@@ -446,6 +596,9 @@ def execute_query(db_name):
                         entry["rows"] = rows
 
                     responses.append(entry)
+
+            if had_write:
+                clear_metadata_cache(db_name=db_name)
 
             elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
             log_request_and_sql(
