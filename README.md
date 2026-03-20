@@ -54,6 +54,11 @@ DB_URL_TEST=sqlite:///./test.db
 # (Optional) Restrict databases to Read-Only mode to prevent accidental writes
 DB_MODE_MAIN=READONLY
 DB_MODE_TEST=READWRITE
+
+# (Optional) Advanced Connection Pooling for High Concurrency
+# Customize how many parallel connections the Gateway maintains to your DB to prevent overload
+DB_POOL_SIZE=10
+DB_MAX_OVERFLOW=20
 ```
 
 ### Step 5: Start the App
@@ -64,6 +69,9 @@ Click the **Restart** button in the cPanel Python App interface. Your API is now
 All protected routes require your `API_KEY`. You can send it in two ways:
 1.  **Header**: `X-API-Key: your_super_secret_api_key_here`
 2.  **Query Parameter**: `?api_key=your_super_secret_api_key_here`
+
+> [!TIP]
+> **ModSecurity Bypass:** If your cPanel server uses strict ModSecurity WAF rules, sending complex API Keys (with symbols like `@`, `!`, `^`) via the `X-API-Key` HTTP Header will often trigger a **403 Forbidden** block. To easily bypass this, URL-encode your key and send it entirely via the Query Parameter instead!
 
 ### 🩺 1. Global Health Check & Database Status
 Ping all your databases instantly to see which ones are online, offline, or in read-only mode.
@@ -132,11 +140,13 @@ curl -X POST "https://yourdomain.com/api/test/query" \
          }'
 ```
 
-### 🛡️ 6. Built-in Security & Monitoring Features
-The Gateway automatically handles advanced security and performance tracking in the background:
+### 🛡️ 6. Built-in Performance & Security Features
+The Gateway automatically handles advanced security, caching, and performance tracking in the background:
 
+*   **High-Concurrency Connection Pooling**: Automatically scales connections via `DB_POOL_SIZE` and `DB_MAX_OVERFLOW` to safely process massive parallel API loads without crashing your database.
+*   **Instant Schema Caching**: All metadata endpoints (Tables & Schemas) utilize deep Python in-memory LRU caching. After the first call, they instantly return data from RAM—lightening database load dramatically.
+*   **Comprehensive Audit Logging**: Every HTTP API request and every raw executed SQL query (along with its execution time) is comprehensively logged inside `api_gateway.log` for secure auditing.
 *   **Execution Profiling**: Every JSON response includes `"execution_time_ms"`, showing exactly how fast the query ran on your database.
-*   **Slow Query Logging**: If a query takes more than 1 second (1000ms), it is automatically recorded in the `api_gateway.log` file in your root folder.
+*   **Slow Query Alerts**: If a query takes more than 1 second (1000ms), a specific Warning alert is logged to `api_gateway.log`.
 *   **Multi-Statement Blocking**: Thwarts piggybacking SQL injection attacks by strictly blocking queries that attempt to run multiple separated SQL commands.
-*   **CORS Ready**: Automatically handles `OPTIONS` preflight requests so you can call the API directly from a React, Vue, or Vanilla JS frontend application.
-*   **Read-Only Defense**: If you set `DB_MODE_MAIN=READONLY` in your `.env`, the gateway will intercept and immediately reject any `INSERT, UPDATE, DELETE, CREATE, DROP, ALTER` payload aimed at that database.
+*   **Read-Only Defense**: If you set `DB_MODE_{NAME}=READONLY` in your `.env`, the gateway will intercept and immediately reject any `INSERT, UPDATE, DELETE, CREATE, DROP, ALTER` payload at the API level.
