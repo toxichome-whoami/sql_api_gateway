@@ -46,7 +46,7 @@ API_KEY=your_super_secret_api_key_here
 # (Optional) Restrict access to specific IPs
 ALLOWED_IPS=192.168.1.100, 10.0.0.5
 
-# Configure your databases dynamically. 
+# Configure your databases dynamically.
 # The {NAME} you use here is how you will call the database in the API URL.
 DB_URL_MAIN=mysql+pymysql://user:pass@localhost/main_db
 DB_URL_TEST=sqlite:///./test.db
@@ -58,8 +58,6 @@ DB_MODE_TEST=READWRITE
 
 ### Step 5: Start the App
 Click the **Restart** button in the cPanel Python App interface. Your API is now live!
-
----
 
 ## 2. How to Use the Features
 
@@ -106,7 +104,7 @@ curl "https://yourdomain.com/api/main/table/users/schema?api_key=YOUR_KEY"
 ```
 
 ### ⚡ 5. Execute Raw SQL Queries (Safe Parameter Binding)
-Run DML (Select, Insert) and DDL (Create, Drop) queries dynamically. 
+Run DML (Select, Insert) and DDL (Create, Drop) queries dynamically.
 
 *   **Endpoint:** `POST /api/<db_name>/query`
 *   **Body Content-Type:** `application/json`
