@@ -3,6 +3,7 @@ import os
 import logging
 import time
 from flask import Flask, request, jsonify, abort
+from flask_limiter import Limiter
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import SQLAlchemyError
 import functools
@@ -21,6 +22,18 @@ logger = logging.getLogger(__name__)
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 app = Flask(__name__)
 API_KEY = os.environ.get("API_KEY")
+
+# Global Rate Limiting
+def get_real_ip():
+    forwarded = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+    return forwarded.split(",")[0].strip() or "127.0.0.1"
+
+limiter = Limiter(
+    get_real_ip,
+    app=app,
+    default_limits=[os.environ.get("RATE_LIMIT", "1000 per minute")],
+    storage_uri="memory://"
+)
 
 # --- Advanced Security Configuration ---
 # 1. IP Whitelisting: Comma-separated list of safe IPs. If empty, all IPs allowed.
@@ -176,73 +189,104 @@ def get_table_schema(db_name, table_name):
     verify_api_key()
     return jsonify({"database": db_name, "table": table_name, "schema": _fetch_table_schema(db_name, table_name)})
 
+@app.route("/api/cache/clear", methods=["POST", "OPTIONS"], strict_slashes=False)
+def clear_cache():
+    """Manually flush the LRU metadata cache so newly created tables appear instantly."""
+    if request.method == "OPTIONS":
+        return jsonify({})
+    verify_api_key()
+    _fetch_table_names.cache_clear()
+    _fetch_table_schema.cache_clear()
+    return jsonify({"success": True, "message": "Schema cache completely flushed."})
+
 @app.route("/api/<db_name>/query", methods=["POST", "OPTIONS"], strict_slashes=False)
 def execute_query(db_name):
-    """Execute SQL with advanced security mapping and timing."""
+    """Execute single or multiple SQL queries within a secure transaction scope."""
     if request.method == "OPTIONS":
         return jsonify({}) # Required for CORS
 
     verify_api_key()
 
     data = request.get_json()
-    if not data or 'query' not in data:
-        abort(400, description="Payload must contain 'query'.")
+    if not data:
+        abort(400, description="Payload must contain JSON.")
 
-    query_str = data.get('query').strip()
-    params = data.get('params', {})
-
-    # Security Rule 1: Prevent basic stacked queries
-    if ";" in query_str.rstrip(";"):
-        logger.warning(f"Blocked multi-statement query attempt.")
-        abort(400, description="Multiple SQL statements are restricted.")
+    # Parse Payload Batch
+    queries = []
+    if 'queries' in data and isinstance(data['queries'], list):
+        queries = data['queries']
+    elif 'query' in data:
+        queries = [{"query": data['query'], "params": data.get('params', {})}]
+    else:
+        abort(400, description="Payload must contain 'query' string or 'queries' array.")
 
     engine = get_engine(db_name)
-    is_modifying = query_str.upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "REPLACE"))
-
-    # Security Rule 2: Database Mode Enforcement
-    if is_modifying and db_permissions.get(db_name.upper()) == "READONLY":
-        logger.warning(f"Blocked write attempt on READONLY database {db_name}")
-        abort(403, description=f"Database '{db_name}' is locked in READONLY mode.")
-
-    # Start execution timer
     start_time = time.time()
+    
+    # Pre-flight Validation & Auto-Clamping Loop
+    for q in queries:
+        query_str = q.get('query', '').strip()
+        
+        # Security Rule 1: Prevent basic stacked queries INSIDE single entries
+        if ";" in query_str.rstrip(";"):
+            logger.warning(f"Blocked inline multi-statement query attempt.")
+            abort(400, description="Multiple SQL statements restricted per field. Use 'queries' array for transactions.")
 
+        # Security Rule 2: Database Mode Enforcement
+        is_modifying = query_str.upper().startswith(("INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE", "REPLACE"))
+        if is_modifying and db_permissions.get(db_name.upper()) == "READONLY":
+            logger.warning(f"Blocked write attempt on READONLY database {db_name}")
+            abort(403, description=f"Database '{db_name}' is locked in READONLY mode.")
+            
+        # Security Rule 3: Forced Safe Pagination
+        if query_str.upper().startswith("SELECT") and "LIMIT" not in query_str.upper():
+            query_str = query_str.rstrip(";") + " LIMIT 1000"
+            logger.info("Automatically clamped unpaginated SELECT query with LIMIT 1000")
+            
+        q['safe_query'] = query_str
+        q['is_modifying'] = is_modifying
+
+    results = []
     try:
-        with engine.connect() as conn:
-            sql = text(query_str)
-            result = conn.execute(sql, params)
+        # Transaction Context Manager - Error in any query rolls back the ENTIRE batch instantly
+        with engine.begin() as conn:
+            for q in queries:
+                sql = text(q['safe_query'])
+                result = conn.execute(sql, q.get('params', {}))
+                
+                if result.returns_rows:
+                    rows = [dict(row._mapping) for row in result.fetchall()]
+                    results.append({"rowcount": len(rows), "data": rows})
+                elif q['is_modifying']:
+                    results.append({"rowcount": result.rowcount})
+                else:
+                    results.append({"message": "Query executed successfully."})
 
-            exec_time_ms = round((time.time() - start_time) * 1000, 2)
+        exec_time_ms = round((time.time() - start_time) * 1000, 2)
+        
+        logger.info(f"Transaction on '{db_name}' completed ({len(queries)} ops) in {exec_time_ms}ms")
+        
+        if exec_time_ms > 1000:
+            logger.warning(f"Slow Transaction Alert '{db_name}' ({exec_time_ms}ms) across {len(queries)} operations.")
 
-            # Log EVERY query executed
-            logger.info(f"Query on '{db_name}' ({exec_time_ms}ms): {query_str[:150]}")
+        # Backward compatibility wrapper for single-query requests
+        if 'query' in data and not 'queries' in data:
+            final_res = results[0]
+            final_res['success'] = True
+            final_res['execution_time_ms'] = exec_time_ms
+            return jsonify(final_res)
+            
+        return jsonify({
+            "success": True, 
+            "execution_time_ms": exec_time_ms,
+            "transaction_count": len(results),
+            "results": results
+        })
 
-            # Warning for slow queries (>1000ms)
-            if exec_time_ms > 1000:
-                logger.warning(f"Slow Query Alert '{db_name}' ({exec_time_ms}ms): {query_str[:150]}...")
-
-            if is_modifying:
-                conn.commit()
-                return jsonify({
-                    "success": True,
-                    "rowcount": result.rowcount,
-                    "execution_time_ms": exec_time_ms
-                })
-
-            if result.returns_rows:
-                rows = [dict(row._mapping) for row in result.fetchall()]
-                return jsonify({
-                    "success": True,
-                    "rowcount": len(rows),
-                    "data": rows,
-                    "execution_time_ms": exec_time_ms
-                })
-
-            return jsonify({"success": True, "message": "Query executed.", "execution_time_ms": exec_time_ms})
-
-    except SQLAlchemyError:
-        # Hide SQL syntax errors from response to prevent mapping attacks
-        abort(400, description="Database Execution Error. Check syntax and constraints.")
+    except SQLAlchemyError as e:
+        logger.error(f"Execution Error: {str(e)}")
+        # Client intentionally receives a blanket message to prevent exposing exact internal DB states if a transaction fails
+        abort(400, description="Database Execution Error. The entire query batch has been successfully isolated and rolled back.")
 
 if __name__ == "__main__":
     app.run(debug=True)

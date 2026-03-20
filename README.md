@@ -109,42 +109,51 @@ Retrieve the exact column names, data types, and primary key constraints for a s
 curl "https://yourdomain.com/api/main/table/users/schema?api_key=YOUR_KEY"
 ```
 
-### ⚡ 5. Execute Raw SQL Queries (Safe Parameter Binding)
-Run DML (Select, Insert) and DDL (Create, Drop) queries dynamically.
+### 🧹 5. Cache Management (Schema Refresh)
+The gateway heavily caches database schemas in memory for high performance. If you create or modify tables, use this endpoint to force the gateway to refresh its memory.
 
-*   **Endpoint:** `POST /api/<db_name>/query`
-*   **Body Content-Type:** `application/json`
+*   **Endpoint:** `POST /api/cache/clear`
 
-**Example: SELECT Query (Fetching Data)**
 ```bash
-curl -X POST "https://yourdomain.com/api/main/query" \
-     -H "X-API-Key: YOUR_KEY" \
+curl -X POST "https://yourdomain.com/api/cache/clear?api_key=YOUR_KEY"
+```
+
+### ⚡ 6. Execute Raw SQL Queries (Single or Transactional Batch)
+Run single queries or full transactional batches.
+
+**Example: Single SELECT Query**
+```bash
+curl -X POST "https://yourdomain.com/api/main/query?api_key=YOUR_KEY" \
      -H "Content-Type: application/json" \
      -d '{
-           "query": "SELECT * FROM users WHERE status = :status LIMIT 10",
+           "query": "SELECT * FROM users WHERE status = :status",
            "params": {"status": "active"}
          }'
 ```
-*Note: Using `:status` in the query and supplying `"params": {"status": "active"}` completely protects you from SQL Injection!*
+*Note: If no `LIMIT` is provided, the gateway automatically appends `LIMIT 1000` for server stability.*
 
-**Example: INSERT Query (Modifying Data)**
+**Example: Multi-Query Transactional Batch**
+Perform multiple operations in a single atomic transaction. If *any* query fails, the entire batch is rolled back automatically.
+
 ```bash
-curl -X POST "https://yourdomain.com/api/test/query" \
-     -H "X-API-Key: YOUR_KEY" \
+curl -X POST "https://yourdomain.com/api/main/query?api_key=YOUR_KEY" \
      -H "Content-Type: application/json" \
      -d '{
-           "query": "INSERT INTO logs (event, ip) VALUES (:event, :ip)",
-           "params": {"event": "login", "ip": "192.168.1.1"}
+           "queries": [
+             { "query": "DROP TABLE IF EXISTS test_products" },
+             { "query": "CREATE TABLE test_products (id INT, name VARCHAR(50))" },
+             { "query": "INSERT INTO test_products (id, name) VALUES (1, :name)", "params": {"name": "Prod A"} }
+           ]
          }'
 ```
 
-### 🛡️ 6. Built-in Performance & Security Features
+### 🛡️ 7. Built-in Performance & Security Features
 The Gateway automatically handles advanced security, caching, and performance tracking in the background:
 
+*   **DDoS Protection (Rate Limiting)**: The gateway tracks incoming IPs and enforces a strict request limit (configurable via `RATE_LIMIT` in `.env`) using the `Flask-Limiter` engine.
 *   **High-Concurrency Connection Pooling**: Automatically scales connections via `DB_POOL_SIZE` and `DB_MAX_OVERFLOW` to safely process massive parallel API loads without crashing your database.
-*   **Instant Schema Caching**: All metadata endpoints (Tables & Schemas) utilize deep Python in-memory LRU caching. After the first call, they instantly return data from RAM—lightening database load dramatically.
-*   **Comprehensive Audit Logging**: Every HTTP API request and every raw executed SQL query (along with its execution time) is comprehensively logged inside `api_gateway.log` for secure auditing.
-*   **Execution Profiling**: Every JSON response includes `"execution_time_ms"`, showing exactly how fast the query ran on your database.
-*   **Slow Query Alerts**: If a query takes more than 1 second (1000ms), a specific Warning alert is logged to `api_gateway.log`.
-*   **Multi-Statement Blocking**: Thwarts piggybacking SQL injection attacks by strictly blocking queries that attempt to run multiple separated SQL commands.
+*   **Instant Schema Caching**: All metadata endpoints (Tables & Schemas) utilize deep Python in-memory LRU caching. After the first call, they instantly return data from RAM.
+*   **Comprehensive Audit Logging**: Every HTTP API request and every raw executed SQL query (along with its execution time) is comprehensively logged inside `api_gateway.log`.
+*   **Safety SELECT Limits**: To prevent memory overload, any `SELECT` query lacking a `LIMIT` clause is automatically clamped to `LIMIT 1000`.
+*   **Transactional Integrity**: Using the `queries` batch array ensures atomicity—if a multi-step query fails at step 50, the database is perfectly rolled back.
 *   **Read-Only Defense**: If you set `DB_MODE_{NAME}=READONLY` in your `.env`, the gateway will intercept and immediately reject any `INSERT, UPDATE, DELETE, CREATE, DROP, ALTER` payload at the API level.

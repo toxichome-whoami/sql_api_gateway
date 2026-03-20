@@ -1,5 +1,6 @@
 flask==3.0.3
 werkzeug==3.0.3
+Flask-Limiter==3.8.0
 sqlalchemy==2.0.35
 python-dotenv==1.0.0
 # Add your database drivers here based on which databases you connect to:
