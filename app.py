@@ -1,4 +1,4 @@
-from sqlalchemy.sql.roles import TruncatedLabelRole
+
 import os
 import logging
 import time
@@ -7,26 +7,13 @@ from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
 
-# --- Initialization & Enhanced Logging ---
+# --- Initialization ---
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-
-# Custom log record factory to inject remote_addr into logs
-old_factory = logging.getLogRecordFactory()
-def record_factory(*args, **kwargs):
-    record = old_factory(*args, **kwargs)
-    try:
-        from flask import request
-        # Handle proxied IP from cPanel/Nginx
-        record.remote_addr = request.headers.get("X-Forwarded-For", request.remote_addr).split(",")[0].strip()
-    except Exception:
-        record.remote_addr = "SYSTEM"
-    return record
-logging.setLogRecordFactory(record_factory)
 
 logging.basicConfig(
     filename=os.path.join(PROJECT_ROOT, 'api_gateway.log'),
     level=logging.INFO,
-    format='%(asctime)s - [%(remote_addr)s] - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -42,30 +29,38 @@ ALLOWED_IPS = [ip.strip() for ip in os.environ.get("ALLOWED_IPS", "").split(",")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 
 @app.after_request
-def apply_security_headers(response):
-    """Apply strict security headers and CORS to every response."""
+def apply_security_headers_and_log(response):
+    """Apply strict security headers, CORS, and log every request."""
     response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    
     # Security definitions
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    
+    # Comprehensive Request Logging
+    forwarded = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+    client_ip = forwarded.split(",")[0].strip() or "Unknown"
+    logger.info(f"[{client_ip}] {request.method} {request.path} - HTTP {response.status_code}")
+    
     return response
 
 @app.before_request
 def check_ip_whitelist():
     """Block IPs that are not explicitly whitelisted (if whitelist is active)."""
     if ALLOWED_IPS:
-        client_ip = request.headers.get("X-Forwarded-For", request.remote_addr).split(",")[0].strip()
-        if client_ip not in ALLOWED_IPS:
+        forwarded = request.headers.get("X-Forwarded-For", request.remote_addr) or ""
+        client_ip = forwarded.split(",")[0].strip()
+        if client_ip and client_ip not in ALLOWED_IPS:
             logger.warning(f"Blocked request from non-whitelisted IP: {client_ip}")
             abort(403, description="Access forbidden: Your IP is not permitted.")
 
 def verify_api_key():
     """Verify Master Key from X-API-Key header OR api_key query parameter."""
     if request.method == "OPTIONS":
-        return # Allow CORS preflight 
-        
+        return # Allow CORS preflight
+
     token = request.headers.get("X-API-Key") or request.args.get("api_key")
     if not token or token != API_KEY:
         logger.warning(f"Unauthorized API access attempt. Invalid/Missing API Key.")
@@ -111,15 +106,15 @@ def get_engine(db_name: str):
 
 # --- Endpoints ---
 
-@app.route("/", methods=["GET", "OPTIONS"])
+@app.route("/", methods=["GET", "OPTIONS"], strict_slashes=False)
 def index():
     return jsonify({
-        "status": "Gateway online", 
+        "status": "Gateway online",
         "security": "Maximum",
         "ip_whitelisting": "Enabled" if ALLOWED_IPS else "Disabled"
     })
 
-@app.route("/health", methods=["GET", "OPTIONS"])
+@app.route("/health", methods=["GET", "OPTIONS"], strict_slashes=False)
 def health_check():
     """Monitor connectivity to all databases and return statuses."""
     status = {"status": "ok", "databases": {}}
@@ -137,7 +132,7 @@ def health_check():
                 status["databases"][name] = {"status": "offline"}
     return jsonify(status)
 
-@app.route("/api/databases", methods=["GET", "OPTIONS"])
+@app.route("/api/databases", methods=["GET", "OPTIONS"], strict_slashes=False)
 def list_databases():
     verify_api_key()
     dbs = []
@@ -146,19 +141,19 @@ def list_databases():
             db_name = k.replace("DB_URL_", "").lower()
             get_engine(db_name) # Ensure permissions cache is populated
             dbs.append({
-                "name": db_name, 
+                "name": db_name,
                 "mode": db_permissions.get(db_name.upper(), "READWRITE")
             })
     return jsonify({"configured_databases": dbs})
 
-@app.route("/api/<db_name>/tables", methods=["GET", "OPTIONS"])
+@app.route("/api/<db_name>/tables", methods=["GET", "OPTIONS"], strict_slashes=False)
 def list_tables(db_name):
     verify_api_key()
     engine = get_engine(db_name)
     tables = inspect(engine).get_table_names()
     return jsonify({"database": db_name, "tables": tables})
 
-@app.route("/api/<db_name>/table/<table_name>/schema", methods=["GET", "OPTIONS"])
+@app.route("/api/<db_name>/table/<table_name>/schema", methods=["GET", "OPTIONS"], strict_slashes=False)
 def get_table_schema(db_name, table_name):
     verify_api_key()
     engine = get_engine(db_name)
@@ -166,23 +161,23 @@ def get_table_schema(db_name, table_name):
     schema = [{"name": c['name'], "type": str(c['type']), "nullable": c['nullable']} for c in columns]
     return jsonify({"database": db_name, "table": table_name, "schema": schema})
 
-@app.route("/api/<db_name>/query", methods=["POST", "OPTIONS"])
+@app.route("/api/<db_name>/query", methods=["POST", "OPTIONS"], strict_slashes=False)
 def execute_query(db_name):
     """Execute SQL with advanced security mapping and timing."""
     if request.method == "OPTIONS":
         return jsonify({}) # Required for CORS
-        
+
     verify_api_key()
-    
+
     data = request.get_json()
     if not data or 'query' not in data:
         abort(400, description="Payload must contain 'query'.")
-    
+
     query_str = data.get('query').strip()
     params = data.get('params', {})
-    
+
     # Security Rule 1: Prevent basic stacked queries
-    if ";" in query_str and not query_str.endswith(";"):
+    if ";" in query_str.rstrip(";"):
         logger.warning(f"Blocked multi-statement query attempt.")
         abort(400, description="Multiple SQL statements are restricted.")
 
@@ -193,38 +188,41 @@ def execute_query(db_name):
     if is_modifying and db_permissions.get(db_name.upper()) == "READONLY":
         logger.warning(f"Blocked write attempt on READONLY database {db_name}")
         abort(403, description=f"Database '{db_name}' is locked in READONLY mode.")
-    
+
     # Start execution timer
     start_time = time.time()
-    
+
     try:
         with engine.connect() as conn:
             sql = text(query_str)
             result = conn.execute(sql, params)
-            
+
             exec_time_ms = round((time.time() - start_time) * 1000, 2)
-            
-            # Application-level slow query logger (>1000ms)
+
+            # Log EVERY query executed
+            logger.info(f"Query on '{db_name}' ({exec_time_ms}ms): {query_str[:150]}")
+
+            # Warning for slow queries (>1000ms)
             if exec_time_ms > 1000:
-                logger.warning(f"Slow Query '{db_name}' ({exec_time_ms}ms): {query_str[:100]}...")
-            
+                logger.warning(f"Slow Query Alert '{db_name}' ({exec_time_ms}ms): {query_str[:150]}...")
+
             if is_modifying:
                 conn.commit()
                 return jsonify({
-                    "success": True, 
+                    "success": True,
                     "rowcount": result.rowcount,
                     "execution_time_ms": exec_time_ms
                 })
-            
+
             if result.returns_rows:
                 rows = [dict(row._mapping) for row in result.fetchall()]
                 return jsonify({
-                    "success": True, 
-                    "rowcount": len(rows), 
+                    "success": True,
+                    "rowcount": len(rows),
                     "data": rows,
                     "execution_time_ms": exec_time_ms
                 })
-            
+
             return jsonify({"success": True, "message": "Query executed.", "execution_time_ms": exec_time_ms})
 
     except SQLAlchemyError:
