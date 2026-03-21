@@ -6,7 +6,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from functools import wraps
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from sqlalchemy import create_engine, text, inspect
@@ -29,6 +29,8 @@ ALLOWED_IPS = {ip.strip() for ip in ALLOWED_IPS_RAW.split(",") if ip.strip()}
 RATE_LIMIT = os.getenv("RATE_LIMIT", "60 per minute").strip()
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
 DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
+STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "500"))
+QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "15"))
 
 LOG_FILE = os.getenv("LOG_FILE", "api_gateway.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -80,7 +82,8 @@ def build_engine(db_url: str) -> Engine:
         engine_kwargs["pool_size"] = DB_POOL_SIZE
         engine_kwargs["max_overflow"] = DB_MAX_OVERFLOW
 
-    return create_engine(db_url, **engine_kwargs)
+    engine = create_engine(db_url, **engine_kwargs)
+    return engine.execution_options(timeout=QUERY_TIMEOUT_SECONDS)
 
 
 def load_databases():
@@ -445,19 +448,50 @@ def execute_query(db_name):
             validate_role_for_sql(db["mode"], role, sql)
             app.logger.info("[QUERY] Executing single query on '%s' | Type: %s | IP: %s | Role: %s", db_name, first_sql_keyword(sql), get_client_ip(), role)
 
+            if is_select_query(sql):
+                def generate_stream():
+                    yield '{"database": "' + db_name.lower() + '", "mode": "' + db["mode"] + '", "query": ' + json.dumps(sql) + ', "rows": ['
+                    try:
+                        with db["engine"].begin() as conn:
+                            # Use yield_per to force server-side cursors in the DB driver (max speed, zero RAM buffer)
+                            result = conn.execution_options(yield_per=STREAM_CHUNK_SIZE).execute(text(sql), single_params or {})
+                            first = True
+                            while True:
+                                chunk = result.fetchmany(STREAM_CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                for row in chunk:
+                                    if not first:
+                                        yield ','
+                                    yield json.dumps(dict(row._mapping), default=str)
+                                    first = False
+                            
+                        yield '], "status": "success"}'
+                    except Exception as e:
+                        app.logger.error("[STREAM ERROR] on '%s' | %s", db_name, str(e))
+                        yield '], "error": ' + json.dumps(str(e)) + '}'
+
+                    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+                    log_request_and_sql(
+                        path=request.path,
+                        method=request.method,
+                        db_name=db_name.lower(),
+                        sql=sql + " (STREAMED)",
+                        elapsed_ms=elapsed_ms,
+                        status_code=200
+                    )
+
+                return Response(stream_with_context(generate_stream()), mimetype="application/json")
+
+            # For non-SELECT single queries
             with db["engine"].begin() as conn:
                 result = conn.execute(text(sql), single_params or {})
-                rows = rows_to_dicts(result)
-
                 response = {
                     "database": db_name.lower(),
                     "mode": db["mode"],
                     "query": sql,
                     "rowcount": result.rowcount
                 }
-
-                if rows is not None:
-                    response["rows"] = rows
 
             elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
             log_request_and_sql(
