@@ -37,13 +37,21 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 # Logging
 # =========================================================
 
-if not app.logger.handlers:
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    handler.setFormatter(formatter)
-    handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-    app.logger.addHandler(handler)
-    app.logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+# Always attach the file handler (Flask pre-adds a default StreamHandler,
+# so "if not app.logger.handlers" would skip this block entirely).
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
+log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+app.logger.addHandler(file_handler)
+app.logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+# Log startup configuration
+app.logger.info("=== API GATEWAY STARTING ===")
+app.logger.info("Log Level: %s | Log File: %s", LOG_LEVEL, LOG_FILE)
+app.logger.info("Rate Limit: %s | Pool Size: %d | Max Overflow: %d", RATE_LIMIT, DB_POOL_SIZE, DB_MAX_OVERFLOW)
+app.logger.info("IP Allowlist: %s", list(ALLOWED_IPS) if ALLOWED_IPS else "DISABLED (all IPs allowed)")
+app.logger.info("API Key configured: %s", "YES" if API_KEY else "NO (WARNING: server will reject all requests)")
 
 # =========================================================
 # Rate Limiter
@@ -85,13 +93,21 @@ def load_databases():
             db_url = value.strip()
             mode = os.getenv(f"DB_MODE_{alias.upper()}", "READWRITE").strip().upper()
 
-            DATABASES[alias] = {
-                "url": db_url,
-                "mode": mode,
-                "engine": build_engine(db_url)
-            }
+            try:
+                engine = build_engine(db_url)
+                DATABASES[alias] = {
+                    "url": db_url,
+                    "mode": mode,
+                    "engine": engine
+                }
+                app.logger.info("[DB REGISTRY] Loaded '%s' | Mode: %s", alias, mode)
+            except Exception as e:
+                app.logger.error("[DB REGISTRY] FAILED to load '%s': %s", alias, str(e))
 
-    app.logger.info("Loaded databases: %s", list(DATABASES.keys()))
+    if DATABASES:
+        app.logger.info("[DB REGISTRY] Total databases loaded: %d -> %s", len(DATABASES), list(DATABASES.keys()))
+    else:
+        app.logger.warning("[DB REGISTRY] No databases found. Check DB_URL_* variables in .env.")
 
 
 load_databases()
@@ -119,11 +135,14 @@ def require_api_key(f):
         provided_key = request.headers.get("X-API-Key", "").strip() or request.args.get("api_key", "").strip()
 
         if not API_KEY:
+            app.logger.error("[AUTH] REJECTED %s %s - API_KEY not configured on server", request.method, request.path)
             return jsonify({"error": "Server misconfiguration: API_KEY not set"}), 500
 
         if provided_key != API_KEY:
+            app.logger.warning("[AUTH] REJECTED %s %s from %s - Invalid API key", request.method, request.path, get_client_ip())
             return jsonify({"error": "Unauthorized"}), 401
 
+        app.logger.debug("[AUTH] ACCEPTED %s %s from %s", request.method, request.path, get_client_ip())
         return f(*args, **kwargs)
     return wrapper
 
@@ -136,6 +155,7 @@ def require_ip_allowlist(f):
 
         client_ip = get_client_ip()
         if client_ip not in ALLOWED_IPS:
+            app.logger.warning("[IP BLOCK] REJECTED %s %s from %s - IP not in allowlist", request.method, request.path, client_ip)
             return jsonify({"error": "Forbidden: IP not allowed", "ip": client_ip}), 403
 
         return f(*args, **kwargs)
@@ -190,7 +210,7 @@ def rows_to_dicts(result):
     return None
 
 
-def log_request_and_sql(path, method, db_name=None, sql=None, elapsed_ms=None, error=None):
+def log_request_and_sql(path, method, db_name=None, sql=None, elapsed_ms=None, error=None, status_code=None):
     payload = {
         "ip": get_client_ip(),
         "method": method,
@@ -198,9 +218,13 @@ def log_request_and_sql(path, method, db_name=None, sql=None, elapsed_ms=None, e
         "db": db_name,
         "elapsed_ms": elapsed_ms,
         "sql": sql,
+        "status_code": status_code,
         "error": str(error) if error else None
     }
-    app.logger.info(json.dumps(payload, default=str))
+    if error:
+        app.logger.error("[QUERY] %s", json.dumps(payload, default=str))
+    else:
+        app.logger.info("[QUERY] %s", json.dumps(payload, default=str))
 
 
 def get_tables(db_name: str):
@@ -241,14 +265,15 @@ def before_request():
 @app.after_request
 def after_request(response):
     elapsed_ms = round((time.perf_counter() - getattr(request, "_start_time", time.perf_counter())) * 1000, 2)
-    try:
-        log_request_and_sql(
-            path=request.path,
-            method=request.method,
-            elapsed_ms=elapsed_ms
-        )
-    except Exception:
-        pass
+    # Log every request with its final status code
+    app.logger.info(
+        "[REQUEST] %s %s -> %d | %sms | IP: %s",
+        request.method,
+        request.path,
+        response.status_code,
+        elapsed_ms,
+        get_client_ip()
+    )
     return response
 
 # =========================================================
@@ -257,16 +282,19 @@ def after_request(response):
 
 @app.errorhandler(429)
 def ratelimit_handler(e):
+    app.logger.warning("[RATE LIMIT] %s %s from %s - Rate limit exceeded", request.method, request.path, get_client_ip())
     return jsonify({"error": "Rate limit exceeded"}), 429
 
 
 @app.errorhandler(404)
 def not_found_handler(e):
+    app.logger.info("[404] %s %s from %s", request.method, request.path, get_client_ip())
     return jsonify({"error": "Not found"}), 404
 
 
 @app.errorhandler(500)
 def internal_error_handler(e):
+    app.logger.error("[500] %s %s from %s - %s", request.method, request.path, get_client_ip(), str(e))
     return jsonify({"error": "Internal server error"}), 500
 
 # =========================================================
@@ -275,6 +303,7 @@ def internal_error_handler(e):
 
 @app.route("/health", methods=["GET"])
 def health():
+    app.logger.info("[HEALTH] Health check initiated from %s", get_client_ip())
     results = {}
 
     for alias, db in DATABASES.items():
@@ -285,12 +314,14 @@ def health():
                 "status": "online",
                 "mode": db["mode"]
             }
+            app.logger.info("[HEALTH] DB '%s' -> ONLINE", alias)
         except Exception as e:
             results[alias] = {
                 "status": "offline",
                 "mode": db["mode"],
                 "error": str(e)
             }
+            app.logger.error("[HEALTH] DB '%s' -> OFFLINE: %s", alias, str(e))
 
     return jsonify({
         "status": "ok",
@@ -316,15 +347,18 @@ def list_databases():
 def list_tables(db_name):
     db, err = get_db_or_404(db_name)
     if err:
+        app.logger.warning("[TABLES] DB '%s' not found - requested by %s", db_name, get_client_ip())
         return err
 
     try:
         tables = get_tables(db_name)
+        app.logger.info("[TABLES] Listed %d tables from '%s' for %s", len(tables), db_name, get_client_ip())
         return jsonify({
             "database": db_name.lower(),
             "tables": tables
         })
     except Exception as e:
+        app.logger.error("[TABLES] Error listing tables from '%s': %s", db_name, str(e))
         return jsonify({"error": str(e)}), 500
 
 
@@ -334,16 +368,19 @@ def list_tables(db_name):
 def get_table_schema(db_name, table_name):
     db, err = get_db_or_404(db_name)
     if err:
+        app.logger.warning("[SCHEMA] DB '%s' not found - requested by %s", db_name, get_client_ip())
         return err
 
     try:
         schema = get_schema(db_name, table_name)
+        app.logger.info("[SCHEMA] Inspected '%s.%s' (%d columns) for %s", db_name, table_name, len(schema), get_client_ip())
         return jsonify({
             "database": db_name.lower(),
             "table": table_name,
             "schema": schema
         })
     except Exception as e:
+        app.logger.error("[SCHEMA] Error inspecting '%s.%s': %s", db_name, table_name, str(e))
         return jsonify({"error": str(e)}), 500
 
 
@@ -372,6 +409,7 @@ def execute_query(db_name):
         if single_query:
             sql = enforce_select_limit(single_query)
             validate_readonly(db["mode"], sql)
+            app.logger.info("[QUERY] Executing single query on '%s' | Type: %s | IP: %s", db_name, first_sql_keyword(sql), get_client_ip())
 
             with db["engine"].begin() as conn:
                 result = conn.execute(text(sql), single_params or {})
@@ -393,7 +431,8 @@ def execute_query(db_name):
                 method=request.method,
                 db_name=db_name.lower(),
                 sql=sql,
-                elapsed_ms=elapsed_ms
+                elapsed_ms=elapsed_ms,
+                status_code=200
             )
             return jsonify(response)
 
@@ -401,11 +440,13 @@ def execute_query(db_name):
             if not isinstance(batch_queries, list) or not batch_queries:
                 return jsonify({"error": "'queries' must be a non-empty list"}), 400
 
+            app.logger.info("[BATCH] Starting batch of %d queries on '%s' | IP: %s", len(batch_queries), db_name, get_client_ip())
             responses = []
 
             with db["engine"].begin() as conn:
                 for idx, item in enumerate(batch_queries, start=1):
                     if not isinstance(item, dict) or "query" not in item:
+                        app.logger.warning("[BATCH] Invalid query object at index %d", idx - 1)
                         return jsonify({"error": f"Invalid query object at index {idx - 1}"}), 400
 
                     sql = enforce_select_limit(item["query"])
@@ -427,12 +468,14 @@ def execute_query(db_name):
                     responses.append(entry)
 
             elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            app.logger.info("[BATCH] Committed %d queries on '%s' in %sms", len(batch_queries), db_name, elapsed_ms)
             log_request_and_sql(
                 path=request.path,
                 method=request.method,
                 db_name=db_name.lower(),
                 sql=f"BATCH ({len(batch_queries)} queries)",
-                elapsed_ms=elapsed_ms
+                elapsed_ms=elapsed_ms,
+                status_code=200
             )
 
             return jsonify({
@@ -444,25 +487,29 @@ def execute_query(db_name):
 
     except PermissionError as e:
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        app.logger.warning("[PERMISSION] Blocked write on '%s' | %s | IP: %s", db_name, str(e), get_client_ip())
         log_request_and_sql(
             path=request.path,
             method=request.method,
             db_name=db_name.lower(),
             sql=single_query or "BATCH",
             elapsed_ms=elapsed_ms,
-            error=e
+            error=e,
+            status_code=403
         )
         return jsonify({"error": str(e)}), 403
 
     except SQLAlchemyError as e:
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        app.logger.error("[DB ERROR] on '%s' | %s | IP: %s", db_name, str(e), get_client_ip())
         log_request_and_sql(
             path=request.path,
             method=request.method,
             db_name=db_name.lower(),
             sql=single_query or "BATCH",
             elapsed_ms=elapsed_ms,
-            error=e
+            error=e,
+            status_code=400
         )
         return jsonify({
             "error": "Database error",
@@ -471,13 +518,15 @@ def execute_query(db_name):
 
     except Exception as e:
         elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        app.logger.error("[FATAL] Unexpected error on '%s' | %s | IP: %s", db_name, str(e), get_client_ip())
         log_request_and_sql(
             path=request.path,
             method=request.method,
             db_name=db_name.lower(),
             sql=single_query or "BATCH",
             elapsed_ms=elapsed_ms,
-            error=e
+            error=e,
+            status_code=500
         )
         return jsonify({
             "error": "Unexpected server error",
@@ -489,4 +538,5 @@ def execute_query(db_name):
 # =========================================================
 
 if __name__ == "__main__":
+    app.logger.info("=== API GATEWAY READY (Manual Start) ===")
     app.run(debug=False)
