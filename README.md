@@ -1,97 +1,101 @@
 # Universal SQL API Gateway
 
-The Universal SQL API Gateway is a high-performance, secure bridge designed to provide RESTful access to isolated SQL databases. Built with Flask and SQLAlchemy, it supports MySQL, PostgreSQL, and SQLite, offering an unified interface for dynamic database operations.
+The Universal SQL API Gateway is a high-performance, professional-grade bridge designed to provide secure RESTful access to isolated SQL databases. Developed with Flask and SQLAlchemy, it supports MySQL, PostgreSQL, and SQLite, offering a unified interface for dynamic database operations across distributed environments.
 
 ## Features
 
-- **Multi-Database Support**: Dynamically load and manage multiple database connections via environment configuration.
-- **Transactional Batch Execution**: Execute multiple SQL statements in a single atomic transaction with automatic rollback on failure.
-- **Security-First Architecture**: Features integrated IP whitelisting, rate limiting, and read-only database enforcement.
-- **Optimized for cPanel**: Architected for reliability in Phusion Passenger environments with efficient connection pooling and low memory overhead.
-- **Automated Query Guard**: Automatically enforces result set limits on SELECT queries to prevent server resource exhaustion.
-- **Sophisticated Metadata Discovery**: Endpoints for exploring database tables and column schemas with high-performance memory caching.
+- **Multi-Database Registry**: Dynamically load and manage multiple database connections through environment-based alias configuration.
+- **Transactional Batch Execution**: Support for executing multiple SQL statements within a single atomic transaction, ensuring data integrity with automatic rollback on failure.
+- **RBAC and Multi-Key Authentication**: Advanced authentication supporting both master API keys and multi-client JSON-based configurations with role-based access control (READONLY, READWRITE, ADMIN).
+- **Security Engineering**: Integrated IP allowlisting, global request throttling (rate limiting), and application-level read-only enforcement.
+- **Automated Query Guard**: Proactive enforcement of result set limits on SELECT queries to prevent resource exhaustion and ensure consistent response times.
+- **Metadata Inspection**: Specialized endpoints for discovering database structures, including table enumeration and detailed column schema inspection.
 
 ## Deployment
 
 ### Prerequisites
-- Python 3.9+ (Python 3.13 recommended)
-- Flask and SQLAlchemy
-- Database drivers (PyMySQL, psycopg2-binary, etc.)
+- Python 3.9 or higher (Python 3.13 recommended for performance)
+- Flask and Flask-Limiter
+- SQLAlchemy 2.0+
+- Appropriate database drivers (e.g., PyMySQL, psycopg2-binary, aiosqlite)
 
 ### Installation
-1. Upload `app.py`, `passenger_wsgi.py`, and `requirements.txt` to the application directory.
-2. Initialize the Python environment and install dependencies:
+1. Deploy `app.py`, `passenger_wsgi.py`, and `requirements.txt` to the application directory on the server.
+2. Install the necessary dependencies via the standard package manager:
    ```bash
    pip install -r requirements.txt
    ```
-3. Configure the `.env` file according to the template provided below.
-4. Set the application startup file to `passenger_wsgi.py` and the entry point to `application` in your server configuration.
+3. Configure the `.env` file based on the technical specifications below.
+4. Set the application startup file to `passenger_wsgi.py` in your web server or cPanel configuration.
 
-## Configuration
+## Configuration Technical Reference
 
-Configuration is managed via environment variables in the `.env` file.
+Configuration is managed via the `.env` file using the following schema:
 
-| Variable | Description |
-| :--- | :--- |
-| `API_KEY` | Master authentication key for all protected routes. |
-| `ALLOWED_IPS` | Comma-separated list of permitted client IP addresses. |
-| `DB_URL_{NAME}` | Connection string for a database alias. |
-| `DB_MODE_{NAME}` | Access mode: `READWRITE` or `READONLY`. |
-| `RATE_LIMIT` | Global request throttling (e.g., "60 per minute"). |
-| `DB_POOL_SIZE` | Number of persistent connections per database engine. |
-| `DB_MAX_OVERFLOW` | Maximum additional connections during peak load. |
+| Variable | Type | Description |
+| :--- | :--- | :--- |
+| `API_KEY` | String | Master authentication key for all protected routes. |
+| `API_KEYS_JSON` | JSON | Advanced multi-client configuration (e.g., `{"client1": {"key": "abc", "role": "READONLY"}}`). |
+| `ALLOWED_IPS` | CSV | Comma-separated list of permitted client IP addresses. |
+| `DB_URL_{ALIAS}` | URI | SQLAlchemy connection string for a specific database alias. |
+| `DB_MODE_{ALIAS}` | Enum | Access mode for the specific database: `READWRITE` or `READONLY`. |
+| `RATE_LIMIT` | String | Global request throttling policy (e.g., "120 per minute"). |
+| `QUERY_TIMEOUT_SECONDS` | Integer | Global timeout for SQL execution. |
+| `DB_POOL_SIZE` | Integer | Connection pool size for each database engine. |
+| `LOG_LEVEL` | Enum | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR`. |
 
-## Authentication
+## Authentication and Security
 
-All API endpoints, with the exception of `/health`, require a valid API key. The gateway supports two primary authentication methods:
+### Authentication Methods
+The gateway requires a valid API key for all routes except `/health`. Keys can be provided through:
+1. **HTTP Header**: Using the `X-API-Key` field.
+2. **Query Parameter**: Using the `api_key` field in the request URL.
 
-1. **HTTP Header**: Provide the key via the `X-API-Key` header.
-2. **Query Parameter**: Provide the key via the `api_key` parameter in the URL.
+### Security Controls
+- **Standardized Limits**: All SELECT queries are automatically appended with `LIMIT 1000` if no limit is specified in the SQL.
+- **Write Keyword Protection**: Operations including `DROP`, `ALTER`, and `TRUNCATE` are strictly validated against the database and client access modes.
+- **Audit Logging**: All database interactions are recorded with client IP, execution time, and SQL payload for forensic and performance analysis.
 
-## API Endpoints
+## API Specification
 
-### Health Check
-`GET /health`
-Returns the operational status and access mode of all registered databases. No authentication required.
+### Operational Health
+`GET /health`  
+Returns the status, access mode, and connectivity of all registered database aliases.
 
-### Database Discovery
-`GET /api/databases`
-Retrieves a list of all configured database aliases and their respective modes.
+### Database Enumeration
+`GET /api/databases`  
+Retrieves a comprehensive list of configured databases available for the authenticated client.
 
-### Table Enumeration
-`GET /api/<db_alias>/tables`
-Lists all tables within the specified database. Results are cached in memory for performance.
+### Table Discovery
+`GET /api/<db_alias>/tables`  
+Lists all available tables within the specified database registry.
 
 ### Schema Inspection
-`GET /api/<db_alias>/table/<table_name>/schema`
-Provides detailed metadata for the specified table, including column types, nullability, and primary key status.
+`GET /api/<db_alias>/table/<table_name>/schema`  
+Provides technical metadata for the specified table, including column types, nullability, and primary key constraints.
 
-### Query Execution
-`POST /api/<db_alias>/query`
-Executes raw SQL queries passed in the request body.
+### Data Interaction
+`POST /api/<db_alias>/query`  
+Executes SQL queries provided in the request body. Supports both single queries and batch transactions.
 
-#### Single Query
+#### Single Query Payload
 ```json
 {
-  "query": "SELECT * FROM users WHERE id = :id",
-  "params": {"id": 101}
+  "query": "SELECT * FROM portfolio_data WHERE category = :cat",
+  "params": {"cat": "active"}
 }
 ```
 
-#### Batch Transaction
+#### Batch Transaction Payload
 ```json
 {
   "queries": [
-    { "query": "INSERT INTO logs (event) VALUES (:e)", "params": {"e": "login"} },
-    { "query": "UPDATE users SET last_login = NOW() WHERE id = :id", "params": {"id": 101} }
+    { "query": "INSERT INTO logs (action) VALUES (:a)", "params": {"a": "update"} },
+    { "query": "UPDATE stats SET hits = hits + 1 WHERE id = :id", "params": {"id": 5} }
   ]
 }
 ```
 
-## Security and Performance
+## Performance Diagnostics
 
-- **Rate Limiting**: Integrated request throttling to prevent denial-of-service attempts.
-- **SQL Sanitization Check**: Enforces a strict `LIMIT 1000` on SELECT queries failing to provide their own limit.
-- **Read-Only Enforcement**: Intercepts and rejects DDL and DML operations at the application layer for databases configured in `READONLY` mode.
-- **Connection Reliability**: Implements `pool_pre_ping` to ensure stale database connections are automatically detected and replaced.
-- **Logging**: Comprehensive structured logging of all requests, including execution times and SQL payloads, in `api_gateway.log`.
+Execution performance is logged systematically. Developers can utilize the provided `test_v2.js` Node.js script to perform automated integration testing and connection validation across all registered registries.
