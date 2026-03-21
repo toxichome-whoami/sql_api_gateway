@@ -22,7 +22,7 @@ app = Flask(__name__)
 # Configuration
 # =========================================================
 
-API_KEY = os.getenv("API_KEY", "").strip()
+API_KEYS = {}
 ALLOWED_IPS_RAW = os.getenv("ALLOWED_IPS", "").strip()
 ALLOWED_IPS = {ip.strip() for ip in ALLOWED_IPS_RAW.split(",") if ip.strip()}
 
@@ -51,7 +51,7 @@ app.logger.info("=== API GATEWAY STARTING ===")
 app.logger.info("Log Level: %s | Log File: %s", LOG_LEVEL, LOG_FILE)
 app.logger.info("Rate Limit: %s | Pool Size: %d | Max Overflow: %d", RATE_LIMIT, DB_POOL_SIZE, DB_MAX_OVERFLOW)
 app.logger.info("IP Allowlist: %s", list(ALLOWED_IPS) if ALLOWED_IPS else "DISABLED (all IPs allowed)")
-app.logger.info("API Key configured: %s", "YES" if API_KEY else "NO (WARNING: server will reject all requests)")
+# API Keys are loaded dynamically in load_api_keys()
 
 # =========================================================
 # Rate Limiter
@@ -110,7 +110,29 @@ def load_databases():
         app.logger.warning("[DB REGISTRY] No databases found. Check DB_URL_* variables in .env.")
 
 
+def load_api_keys():
+    global API_KEYS
+    API_KEYS = {}
+    for key, value in os.environ.items():
+        if key.startswith("API_KEY_"):
+            parts = key.split("_")
+            if len(parts) >= 4:
+                # Format: API_KEY_NAME_ROLE
+                name = parts[2]
+                role = "_".join(parts[3:]).upper()
+                secret = value.strip()
+                if secret:
+                    API_KEYS[secret] = {"name": name, "role": role}
+                    app.logger.info("[AUTH REGISTRY] Loaded key for '%s' | Role: %s", name, role)
+                
+    if API_KEYS:
+        app.logger.info("[AUTH REGISTRY] Total API keys loaded: %d", len(API_KEYS))
+    else:
+        app.logger.warning("[AUTH REGISTRY] No API keys found! Server will reject all requests.")
+
+
 load_databases()
+load_api_keys()
 
 # =========================================================
 # Helpers
@@ -134,15 +156,17 @@ def require_api_key(f):
     def wrapper(*args, **kwargs):
         provided_key = request.headers.get("X-API-Key", "").strip() or request.args.get("api_key", "").strip()
 
-        if not API_KEY:
-            app.logger.error("[AUTH] REJECTED %s %s - API_KEY not configured on server", request.method, request.path)
-            return jsonify({"error": "Server misconfiguration: API_KEY not set"}), 500
+        if not API_KEYS:
+            app.logger.error("[AUTH] REJECTED %s %s - No API keys configured on server", request.method, request.path)
+            return jsonify({"error": "Server misconfiguration: No API keys configured"}), 500
 
-        if provided_key != API_KEY:
+        auth_context = API_KEYS.get(provided_key)
+        if not auth_context:
             app.logger.warning("[AUTH] REJECTED %s %s from %s - Invalid API key", request.method, request.path, get_client_ip())
             return jsonify({"error": "Unauthorized"}), 401
 
-        app.logger.debug("[AUTH] ACCEPTED %s %s from %s", request.method, request.path, get_client_ip())
+        request.auth_context = auth_context
+        app.logger.debug("[AUTH] ACCEPTED %s %s from %s (User: %s)", request.method, request.path, get_client_ip(), auth_context["name"])
         return f(*args, **kwargs)
     return wrapper
 
@@ -199,9 +223,15 @@ def is_write_query(sql: str) -> bool:
     return keyword in WRITE_KEYWORDS
 
 
-def validate_readonly(db_mode: str, sql: str):
+def validate_role_for_sql(db_mode: str, role: str, sql: str):
     if db_mode == "READONLY" and is_write_query(sql):
         raise PermissionError("Write operation blocked: database is in READONLY mode")
+        
+    if role == "READ_ONLY" and is_write_query(sql):
+        raise PermissionError(f"Write operation blocked: API key role is {role}")
+        
+    if role == "WRITE_ONLY" and is_select_query(sql):
+        raise PermissionError(f"Read operation blocked: API key role is {role}")
 
 
 def rows_to_dicts(result):
@@ -211,8 +241,11 @@ def rows_to_dicts(result):
 
 
 def log_request_and_sql(path, method, db_name=None, sql=None, elapsed_ms=None, error=None, status_code=None):
+    auth_context = getattr(request, "auth_context", {})
     payload = {
         "ip": get_client_ip(),
+        "client": auth_context.get("name"),
+        "role": auth_context.get("role"),
         "method": method,
         "path": path,
         "db": db_name,
@@ -408,8 +441,9 @@ def execute_query(db_name):
     try:
         if single_query:
             sql = enforce_select_limit(single_query)
-            validate_readonly(db["mode"], sql)
-            app.logger.info("[QUERY] Executing single query on '%s' | Type: %s | IP: %s", db_name, first_sql_keyword(sql), get_client_ip())
+            role = getattr(request, "auth_context", {}).get("role", "")
+            validate_role_for_sql(db["mode"], role, sql)
+            app.logger.info("[QUERY] Executing single query on '%s' | Type: %s | IP: %s | Role: %s", db_name, first_sql_keyword(sql), get_client_ip(), role)
 
             with db["engine"].begin() as conn:
                 result = conn.execute(text(sql), single_params or {})
@@ -452,7 +486,8 @@ def execute_query(db_name):
                     sql = enforce_select_limit(item["query"])
                     params = item.get("params", {}) or {}
 
-                    validate_readonly(db["mode"], sql)
+                    role = getattr(request, "auth_context", {}).get("role", "")
+                    validate_role_for_sql(db["mode"], role, sql)
 
                     result = conn.execute(text(sql), params)
                     rows = rows_to_dicts(result)
