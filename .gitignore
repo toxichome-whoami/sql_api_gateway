@@ -1,0 +1,38 @@
+# Environment & Secrets
+.env
+.env.ex
+.env.example
+.venv
+venv/
+ENV/
+.python-version
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Project specific logs & databases
+*.log
+*.sqlite
+*.db
+api_gateway.log
+audit.log
+
+# Node.js
+node_modules/
+package-lock.json (exclude if you want to keep lockfile)
+npm-debug.log*
+yarn-debug.log*
+
+# OS specific files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Deployment
+passenger_wsgi.py (keep if you want to exclude local deployment scripts)
+test_v2.js
+test_gateway.js
