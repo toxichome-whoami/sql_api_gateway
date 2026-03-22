@@ -34,5 +34,4 @@ Desktop.ini
 
 # Deployment
 passenger_wsgi.py (keep if you want to exclude local deployment scripts)
-test_v2.js
-test_gateway.js
+test_*
