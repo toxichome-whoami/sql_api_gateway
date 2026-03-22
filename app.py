@@ -36,6 +36,10 @@ DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
 STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "500"))
 QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "15"))
 
+# Feature Flags
+ENABLE_METADATA_ENDPOINTS = os.getenv("ENABLE_METADATA_ENDPOINTS", "true").strip().lower() == "true"
+ENABLE_BATCH_QUERIES = os.getenv("ENABLE_BATCH_QUERIES", "true").strip().lower() == "true"
+
 LOG_FILE = os.getenv("LOG_FILE", "api_gateway.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -95,7 +99,7 @@ def enforce_rate_limit():
     try:
         with sqlite3.connect(LIMITER_DB_PATH, timeout=5) as conn:
             cursor = conn.cursor()
-            
+
             # Check for Persistent Ban
             cursor.execute("SELECT unban_time FROM banned_ips WHERE ip = ?", (client_ip,))
             row = cursor.fetchone()
@@ -111,7 +115,7 @@ def enforce_rate_limit():
             # Hit Tracking
             cursor.execute("SELECT window_time, hits FROM rate_limits WHERE ip = ?", (client_ip,))
             hit_row = cursor.fetchone()
-            
+
             try:
                 rate_limit_max = int(RATE_LIMIT.split()[0])
             except:
@@ -126,7 +130,7 @@ def enforce_rate_limit():
             else:
                 count = hit_row[1] + 1
                 cursor.execute("UPDATE rate_limits SET hits = ? WHERE ip = ?", (count, client_ip))
-                
+
                 if count > rate_limit_max:
                     unban_dt = now_utc + timedelta(seconds=PENALTY_TIMEOUT_SECONDS)
                     unban_utc_str = unban_dt.strftime('%Y-%m-%d %H:%M:%S')
@@ -139,7 +143,7 @@ def enforce_rate_limit():
             if random.random() < 0.01:
                 cursor.execute("DELETE FROM banned_ips WHERE unban_time < ?", (current_utc_str,))
                 cursor.execute("DELETE FROM rate_limits WHERE window_time < ?", ((now_utc - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:00'),))
-            
+
             conn.commit()
     except Exception as e:
         app.logger.error("[LIMITER] SQLite Error: %s", str(e))
@@ -175,21 +179,49 @@ def load_databases():
     DATABASES = {}
 
     for key, value in os.environ.items():
-        if key.startswith("DB_URL_"):
-            alias = key[len("DB_URL_"):].strip().lower()
-            db_url = value.strip()
-            mode = os.getenv(f"DB_MODE_{alias.upper()}", "READWRITE").strip().upper()
+        ukey = key.upper()
+        if not ukey.startswith("DB_URL_"):
+            continue
 
-            try:
-                engine = build_engine(db_url)
-                DATABASES[alias] = {
-                    "url": db_url,
-                    "mode": mode,
-                    "engine": engine
-                }
-                app.logger.info("[DB REGISTRY] Loaded '%s' | Mode: %s", alias, mode)
-            except Exception as e:
-                app.logger.error("[DB REGISTRY] FAILED to load '%s': %s", alias, str(e))
+        raw_name = ukey[len("DB_URL_"):].strip()
+        db_url = value.strip()
+
+        # Initial guess
+        mode = "READWRITE"
+        alias = raw_name.lower()
+
+        # Advanced Suffix Mapping & Legacy Override
+        # We prioritize suffixes, then fallback to DB_MODE, then default to READWRITE
+        if raw_name.endswith("_READONLY"):
+            mode = "READONLY"
+            alias = raw_name[:-9].lower()
+        elif raw_name.endswith("_WRITEONLY"):
+            mode = "WRITEONLY"
+            alias = raw_name[:-10].lower()
+        elif raw_name.endswith("_READWRITE"):
+            mode = "READWRITE"
+            alias = raw_name[:-10].lower()
+        else:
+            # Check for explicit DB_MODE override (Legacy Support for some server configs)
+            mode = os.getenv(f"DB_MODE_{raw_name}", "READWRITE").strip().upper()
+            mode = "READWRITE" if mode not in ["READONLY", "WRITEONLY", "READWRITE"] else mode
+
+        # Skip empty aliases
+        if not alias: continue
+
+        try:
+            # This order allows specific permission keys to be overridden by a more general DB_URL key
+            # OR vice versa depending on environment variable order.
+            # Usually, you'd want the most powerful URL to overwrite.
+            engine = build_engine(db_url)
+            DATABASES[alias] = {
+                "url": db_url,
+                "mode": mode,
+                "engine": engine
+            }
+            app.logger.info("[DB REGISTRY] Mapping alias '%s' | URL: %s... | Mode: %s", alias, db_url[:15], mode)
+        except Exception as e:
+            app.logger.error("[DB REGISTRY] FAILED to load '%s': %s", alias, str(e))
 
     if DATABASES:
         app.logger.info("[DB REGISTRY] Total databases loaded: %d -> %s", len(DATABASES), list(DATABASES.keys()))
@@ -211,7 +243,7 @@ def load_api_keys():
                 if secret:
                     API_KEYS[secret] = {"name": name, "role": role}
                     app.logger.info("[AUTH REGISTRY] Loaded key for '%s' | Role: %s", name, role)
-                
+
     if API_KEYS:
         app.logger.info("[AUTH REGISTRY] Total API keys loaded: %d", len(API_KEYS))
     else:
@@ -313,10 +345,10 @@ def is_write_query(sql: str) -> bool:
 def validate_role_for_sql(db_mode: str, role: str, sql: str):
     if db_mode == "READONLY" and is_write_query(sql):
         raise PermissionError("Write operation blocked: database is in READONLY mode")
-        
+
     if role == "READ_ONLY" and is_write_query(sql):
         raise PermissionError(f"Write operation blocked: API key role is {role}")
-        
+
     if role == "WRITE_ONLY" and is_select_query(sql):
         raise PermissionError(f"Read operation blocked: API key role is {role}")
 
@@ -388,7 +420,7 @@ def after_request(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["X-XSS-Protection"] = "1; mode=block"
-    
+
     elapsed_ms = round((time.perf_counter() - getattr(request, "_start_time", time.perf_counter())) * 1000, 2)
     # Log every request with its final status code
     app.logger.info(
@@ -467,6 +499,9 @@ def list_databases():
 @require_ip_allowlist
 @require_api_key
 def list_tables(db_name):
+    if not ENABLE_METADATA_ENDPOINTS:
+        return jsonify({"error": "Metadata endpoints are disabled on this gateway"}), 403
+
     db, err = get_db_or_404(db_name)
     if err:
         app.logger.warning("[TABLES] DB '%s' not found - requested by %s", db_name, get_client_ip())
@@ -488,6 +523,9 @@ def list_tables(db_name):
 @require_ip_allowlist
 @require_api_key
 def get_table_schema(db_name, table_name):
+    if not ENABLE_METADATA_ENDPOINTS:
+        return jsonify({"error": "Metadata endpoints are disabled on this gateway"}), 403
+
     db, err = get_db_or_404(db_name)
     if err:
         app.logger.warning("[SCHEMA] DB '%s' not found - requested by %s", db_name, get_client_ip())
@@ -551,7 +589,7 @@ def execute_query(db_name):
                                         yield ','
                                     yield json.dumps(dict(row._mapping), default=str)
                                     first = False
-                            
+
                         yield '], "status": "success"}'
                     except Exception as e:
                         app.logger.error("[STREAM ERROR] on '%s' | %s", db_name, str(e))
