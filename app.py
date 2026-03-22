@@ -3,12 +3,13 @@ import re
 import time
 import json
 import logging
+import sqlite3
+import random
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from functools import wraps
 
 from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine import Engine
@@ -17,6 +18,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+# Anti-Payload Bombing: Instantly drop requests with body > 5MB
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024
 
 # =========================================================
 # Configuration
@@ -26,7 +29,8 @@ API_KEYS = {}
 ALLOWED_IPS_RAW = os.getenv("ALLOWED_IPS", "").strip()
 ALLOWED_IPS = {ip.strip() for ip in ALLOWED_IPS_RAW.split(",") if ip.strip()}
 
-RATE_LIMIT = os.getenv("RATE_LIMIT", "60 per minute").strip()
+RATE_LIMIT = os.getenv("RATE_LIMIT", "120 per minute").strip()
+PENALTY_TIMEOUT_SECONDS = int(os.getenv("PENALTY_TIMEOUT_SECONDS", "900"))
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
 DB_MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
 STREAM_CHUNK_SIZE = int(os.getenv("STREAM_CHUNK_SIZE", "500"))
@@ -34,6 +38,16 @@ QUERY_TIMEOUT_SECONDS = int(os.getenv("QUERY_TIMEOUT_SECONDS", "15"))
 
 LOG_FILE = os.getenv("LOG_FILE", "api_gateway.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+LIMITER_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rate_limits.db")
+
+def init_rate_limiter():
+    with sqlite3.connect(LIMITER_DB_PATH) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS rate_limits (ip TEXT PRIMARY KEY, window_time TEXT, hits INTEGER)")
+        conn.execute("CREATE TABLE IF NOT EXISTS banned_ips (ip TEXT PRIMARY KEY, unban_time TEXT)")
+        conn.commit()
+
+init_rate_limiter()
 
 # =========================================================
 # Logging
@@ -56,14 +70,84 @@ app.logger.info("IP Allowlist: %s", list(ALLOWED_IPS) if ALLOWED_IPS else "DISAB
 # API Keys are loaded dynamically in load_api_keys()
 
 # =========================================================
-# Rate Limiter
+# Request Hooks & Security Shield
 # =========================================================
 
-limiter = Limiter(
-    key_func=get_remote_address,
-    app=app,
-    default_limits=[RATE_LIMIT]
-)
+BANNED_IP_CACHE = {}  # Memory Shield for zero-IO blocking
+
+@app.before_request
+def enforce_rate_limit():
+    client_ip = get_client_ip()
+    now_utc = datetime.utcnow()
+    current_utc_str = now_utc.strftime('%Y-%m-%d %H:%M:%S')
+    current_window_str = now_utc.strftime('%Y-%m-%d %H:%M:00')
+
+    # 1. RAM Shield Check (Sub-millisecond rejection for known attackers)
+    if client_ip in BANNED_IP_CACHE:
+        unban_dt = BANNED_IP_CACHE[client_ip]
+        if now_utc < unban_dt:
+            wait_time = int((unban_dt - now_utc).total_seconds())
+            return jsonify({"error": f"IP Banned. Too many requests. Try again in {max(0, wait_time)} seconds. (Unban at {unban_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC)"}), 429
+        else:
+            del BANNED_IP_CACHE[client_ip]
+
+    # 2. SQLite Registry Sync
+    try:
+        with sqlite3.connect(LIMITER_DB_PATH, timeout=5) as conn:
+            cursor = conn.cursor()
+            
+            # Check for Persistent Ban
+            cursor.execute("SELECT unban_time FROM banned_ips WHERE ip = ?", (client_ip,))
+            row = cursor.fetchone()
+            if row:
+                unban_dt = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
+                if now_utc < unban_dt:
+                    BANNED_IP_CACHE[client_ip] = unban_dt # Lift to RAM shield
+                    wait_time = int((unban_dt - now_utc).total_seconds())
+                    return jsonify({"error": f"IP Banned. Too many requests. Try again in {max(0, wait_time)} seconds. (Unban at {row[0]} UTC)"}), 429
+                else:
+                    cursor.execute("DELETE FROM banned_ips WHERE ip = ?", (client_ip,))
+
+            # Hit Tracking
+            cursor.execute("SELECT window_time, hits FROM rate_limits WHERE ip = ?", (client_ip,))
+            hit_row = cursor.fetchone()
+            
+            try:
+                rate_limit_max = int(RATE_LIMIT.split()[0])
+            except:
+                rate_limit_max = 120
+
+            if not hit_row:
+                cursor.execute("INSERT OR IGNORE INTO rate_limits (ip, window_time, hits) VALUES (?, ?, 1)", (client_ip, current_window_str))
+                count = 1
+            elif hit_row[0] != current_window_str:
+                cursor.execute("UPDATE rate_limits SET window_time = ?, hits = 1 WHERE ip = ?", (current_window_str, client_ip))
+                count = 1
+            else:
+                count = hit_row[1] + 1
+                cursor.execute("UPDATE rate_limits SET hits = ? WHERE ip = ?", (count, client_ip))
+                
+                if count > rate_limit_max:
+                    unban_dt = now_utc + timedelta(seconds=PENALTY_TIMEOUT_SECONDS)
+                    unban_utc_str = unban_dt.strftime('%Y-%m-%d %H:%M:%S')
+                    cursor.execute("INSERT OR REPLACE INTO banned_ips (ip, unban_time) VALUES (?, ?)", (client_ip, unban_utc_str))
+                    BANNED_IP_CACHE[client_ip] = unban_dt # Immediate RAM shield
+                    conn.commit()
+                    return jsonify({"error": f"Rate limit exceeded. Banned for {PENALTY_TIMEOUT_SECONDS} seconds. (Unban at {unban_utc_str} UTC)"}), 429
+
+            # 3. Probabilistic Disk Cleanup (Prevents I/O blocking)
+            if random.random() < 0.01:
+                cursor.execute("DELETE FROM banned_ips WHERE unban_time < ?", (current_utc_str,))
+                cursor.execute("DELETE FROM rate_limits WHERE window_time < ?", ((now_utc - timedelta(minutes=5)).strftime('%Y-%m-%d %H:%M:00'),))
+            
+            conn.commit()
+    except Exception as e:
+        app.logger.error("[LIMITER] SQLite Error: %s", str(e))
+        # Fail open for rate limiting if DB is locked to maintain availability, or could fail closed for security.
+
+@app.before_request
+def start_timer():
+    request._start_time = time.perf_counter()
 
 # =========================================================
 # Database Registry
@@ -300,6 +384,11 @@ def before_request():
 
 @app.after_request
 def after_request(response):
+    # Security Headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    
     elapsed_ms = round((time.perf_counter() - getattr(request, "_start_time", time.perf_counter())) * 1000, 2)
     # Log every request with its final status code
     app.logger.info(
@@ -316,10 +405,7 @@ def after_request(response):
 # Error Handlers
 # =========================================================
 
-@app.errorhandler(429)
-def ratelimit_handler(e):
-    app.logger.warning("[RATE LIMIT] %s %s from %s - Rate limit exceeded", request.method, request.path, get_client_ip())
-    return jsonify({"error": "Rate limit exceeded"}), 429
+# Manually handled in enforce_rate_limit before_request hook
 
 
 @app.errorhandler(404)
